@@ -24,9 +24,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient, AuthSource,
+    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, PromptCache, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -39,14 +40,14 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    clear_oauth_credentials, format_usd, generate_pkce_pair, generate_state, load_system_prompt,
-    parse_oauth_callback_request_target, pricing_for_model, resolve_sandbox_status,
-    save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServerManager,
-    McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig,
-    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
-    UsageTracker,
+    clear_oauth_credentials, format_usd, generate_pkce_pair, generate_state,
+    load_oauth_credentials, load_system_prompt, parse_oauth_callback_request_target,
+    pricing_for_model, resolve_sandbox_status, save_oauth_credentials, ApiClient, ApiRequest,
+    AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole, ModelPricing,
+    OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
+    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -133,12 +134,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .run_turn_with_output(&prompt, output_format)?,
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
+        CliAction::Doctor => run_doctor()?,
         CliAction::Init => run_init()?,
         CliAction::Repl {
             model,
             allowed_tools,
             permission_mode,
         } => run_repl(model, allowed_tools, permission_mode)?,
+        CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help => print_help(),
     }
     Ok(())
@@ -180,14 +183,23 @@ enum CliAction {
     },
     Login,
     Logout,
+    Doctor,
     Init,
     Repl {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     },
+    HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
     Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalHelpTopic {
+    Status,
+    Sandbox,
+    Doctor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,8 +353,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     if rest.first().map(String::as_str) == Some("--resume") {
         return parse_resume_args(&rest[1..]);
     }
-    if let Some(action) = parse_single_word_command_alias(&rest, &model, permission_mode_override)
-    {
+    if let Some(action) = parse_local_help_action(&rest) {
+        return action;
+    }
+    if let Some(action) = parse_single_word_command_alias(&rest, &model, permission_mode_override) {
         return action;
     }
 
@@ -388,6 +402,24 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }
 }
 
+fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>> {
+    if rest.len() != 2 || !is_help_flag(&rest[1]) {
+        return None;
+    }
+
+    let topic = match rest[0].as_str() {
+        "status" => LocalHelpTopic::Status,
+        "sandbox" => LocalHelpTopic::Sandbox,
+        "doctor" => LocalHelpTopic::Doctor,
+        _ => return None,
+    };
+    Some(Ok(CliAction::HelpTopic(topic)))
+}
+
+fn is_help_flag(value: &str) -> bool {
+    matches!(value, "--help" | "-h")
+}
+
 fn parse_single_word_command_alias(
     rest: &[String],
     model: &str,
@@ -405,6 +437,7 @@ fn parse_single_word_command_alias(
             permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
         })),
         "sandbox" => Some(Ok(CliAction::Sandbox)),
+        "doctor" => Some(Ok(CliAction::Doctor)),
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
@@ -739,6 +772,396 @@ fn parse_resume_args(args: &[String]) -> Result<CliAction, String> {
         session_path,
         commands,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticLevel {
+    Ok,
+    Warn,
+    Fail,
+}
+
+impl DiagnosticLevel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        }
+    }
+
+    fn is_failure(self) -> bool {
+        matches!(self, Self::Fail)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiagnosticCheck {
+    name: &'static str,
+    level: DiagnosticLevel,
+    summary: String,
+    details: Vec<String>,
+}
+
+impl DiagnosticCheck {
+    fn new(name: &'static str, level: DiagnosticLevel, summary: impl Into<String>) -> Self {
+        Self {
+            name,
+            level,
+            summary: summary.into(),
+            details: Vec::new(),
+        }
+    }
+
+    fn with_details(mut self, details: Vec<String>) -> Self {
+        self.details = details;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorReport {
+    checks: Vec<DiagnosticCheck>,
+}
+
+impl DoctorReport {
+    fn has_failures(&self) -> bool {
+        self.checks.iter().any(|check| check.level.is_failure())
+    }
+
+    fn render(&self) -> String {
+        let ok_count = self
+            .checks
+            .iter()
+            .filter(|check| check.level == DiagnosticLevel::Ok)
+            .count();
+        let warn_count = self
+            .checks
+            .iter()
+            .filter(|check| check.level == DiagnosticLevel::Warn)
+            .count();
+        let fail_count = self
+            .checks
+            .iter()
+            .filter(|check| check.level == DiagnosticLevel::Fail)
+            .count();
+        let mut lines = vec![
+            "Doctor".to_string(),
+            format!(
+                "Summary\n  OK               {ok_count}\n  Warnings         {warn_count}\n  Failures         {fail_count}"
+            ),
+        ];
+        lines.extend(self.checks.iter().map(render_diagnostic_check));
+        lines.join("\n\n")
+    }
+}
+
+fn render_diagnostic_check(check: &DiagnosticCheck) -> String {
+    let mut lines = vec![format!(
+        "{}\n  Status           {}\n  Summary          {}",
+        check.name,
+        check.level.label(),
+        check.summary
+    )];
+    if !check.details.is_empty() {
+        lines.push("  Details".to_string());
+        lines.extend(check.details.iter().map(|detail| format!("    - {detail}")));
+    }
+    lines.join("\n")
+}
+
+fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let config_loader = ConfigLoader::default_for(&cwd);
+    let config = config_loader.load();
+    let discovered_config = config_loader.discover();
+    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let (project_root, git_branch) =
+        parse_git_status_metadata(project_context.git_status.as_deref());
+    let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
+    let empty_config = runtime::RuntimeConfig::empty();
+    let sandbox_config = config.as_ref().ok().unwrap_or(&empty_config);
+    let context = StatusContext {
+        cwd: cwd.clone(),
+        session_path: None,
+        loaded_config_files: config
+            .as_ref()
+            .ok()
+            .map_or(0, |runtime_config| runtime_config.loaded_entries().len()),
+        discovered_config_files: discovered_config.len(),
+        memory_file_count: project_context.instruction_files.len(),
+        project_root,
+        git_branch,
+        git_summary,
+        sandbox_status: resolve_sandbox_status(sandbox_config.sandbox(), &cwd),
+    };
+    Ok(DoctorReport {
+        checks: vec![
+            check_auth_health(),
+            check_config_health(&config_loader, config.as_ref()),
+            check_workspace_health(&context),
+            check_sandbox_health(&context.sandbox_status),
+            check_system_health(&cwd, config.as_ref().ok()),
+        ],
+    })
+}
+
+fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
+    let report = render_doctor_report()?;
+    println!("{}", report.render());
+    if report.has_failures() {
+        return Err("doctor found failing checks".into());
+    }
+    Ok(())
+}
+
+fn check_auth_health() -> DiagnosticCheck {
+    let api_key_present = env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    let auth_token_present = env::var("ANTHROPIC_AUTH_TOKEN")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+
+    match load_oauth_credentials() {
+        Ok(Some(token_set)) => {
+            let expired = oauth_token_is_expired(&api::OAuthTokenSet {
+                access_token: token_set.access_token.clone(),
+                refresh_token: token_set.refresh_token.clone(),
+                expires_at: token_set.expires_at,
+                scopes: token_set.scopes.clone(),
+            });
+            let mut details = vec![
+                format!(
+                    "Environment       api_key={} auth_token={}",
+                    if api_key_present { "present" } else { "absent" },
+                    if auth_token_present {
+                        "present"
+                    } else {
+                        "absent"
+                    }
+                ),
+                format!(
+                    "Saved OAuth       expires_at={} refresh_token={} scopes={}",
+                    token_set
+                        .expires_at
+                        .map_or_else(|| "<none>".to_string(), |value| value.to_string()),
+                    if token_set.refresh_token.is_some() {
+                        "present"
+                    } else {
+                        "absent"
+                    },
+                    if token_set.scopes.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        token_set.scopes.join(",")
+                    }
+                ),
+            ];
+            if expired {
+                details.push(
+                    "Suggested action  claw login to refresh local OAuth credentials".to_string(),
+                );
+            }
+            DiagnosticCheck::new(
+                "Auth",
+                if expired {
+                    DiagnosticLevel::Warn
+                } else {
+                    DiagnosticLevel::Ok
+                },
+                if expired {
+                    "saved OAuth credentials are present but expired"
+                } else if api_key_present || auth_token_present {
+                    "environment and saved credentials are available"
+                } else {
+                    "saved OAuth credentials are available"
+                },
+            )
+            .with_details(details)
+        }
+        Ok(None) => DiagnosticCheck::new(
+            "Auth",
+            if api_key_present || auth_token_present {
+                DiagnosticLevel::Ok
+            } else {
+                DiagnosticLevel::Warn
+            },
+            if api_key_present || auth_token_present {
+                "environment credentials are configured"
+            } else {
+                "no API key or saved OAuth credentials were found"
+            },
+        )
+        .with_details(vec![format!(
+            "Environment       api_key={} auth_token={}",
+            if api_key_present { "present" } else { "absent" },
+            if auth_token_present {
+                "present"
+            } else {
+                "absent"
+            }
+        )]),
+        Err(error) => DiagnosticCheck::new(
+            "Auth",
+            DiagnosticLevel::Fail,
+            format!("failed to inspect saved credentials: {error}"),
+        ),
+    }
+}
+
+fn check_config_health(
+    config_loader: &ConfigLoader,
+    config: Result<&runtime::RuntimeConfig, &runtime::ConfigError>,
+) -> DiagnosticCheck {
+    let discovered = config_loader.discover();
+    let discovered_count = discovered.len();
+    let discovered_paths = discovered
+        .iter()
+        .map(|entry| entry.path.display().to_string())
+        .collect::<Vec<_>>();
+    match config {
+        Ok(runtime_config) => {
+            let loaded_entries = runtime_config.loaded_entries();
+            let mut details = vec![format!(
+                "Config files      loaded {}/{}",
+                loaded_entries.len(),
+                discovered_count
+            )];
+            if let Some(model) = runtime_config.model() {
+                details.push(format!("Resolved model    {model}"));
+            }
+            details.push(format!(
+                "MCP servers       {}",
+                runtime_config.mcp().servers().len()
+            ));
+            if discovered_paths.is_empty() {
+                details.push("Discovered files  <none>".to_string());
+            } else {
+                details.extend(
+                    discovered_paths
+                        .into_iter()
+                        .map(|path| format!("Discovered file   {path}")),
+                );
+            }
+            DiagnosticCheck::new(
+                "Config",
+                if discovered_count == 0 {
+                    DiagnosticLevel::Warn
+                } else {
+                    DiagnosticLevel::Ok
+                },
+                if discovered_count == 0 {
+                    "no config files were found; defaults are active"
+                } else {
+                    "runtime config loaded successfully"
+                },
+            )
+            .with_details(details)
+        }
+        Err(error) => DiagnosticCheck::new(
+            "Config",
+            DiagnosticLevel::Fail,
+            format!("runtime config failed to load: {error}"),
+        )
+        .with_details(if discovered_paths.is_empty() {
+            vec!["Discovered files  <none>".to_string()]
+        } else {
+            discovered_paths
+                .into_iter()
+                .map(|path| format!("Discovered file   {path}"))
+                .collect()
+        }),
+    }
+}
+
+fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
+    let in_repo = context.project_root.is_some();
+    DiagnosticCheck::new(
+        "Workspace",
+        if in_repo {
+            DiagnosticLevel::Ok
+        } else {
+            DiagnosticLevel::Warn
+        },
+        if in_repo {
+            format!(
+                "project root detected on branch {}",
+                context.git_branch.as_deref().unwrap_or("unknown")
+            )
+        } else {
+            "current directory is not inside a git project".to_string()
+        },
+    )
+    .with_details(vec![
+        format!("Cwd              {}", context.cwd.display()),
+        format!(
+            "Project root     {}",
+            context
+                .project_root
+                .as_ref()
+                .map_or_else(|| "<none>".to_string(), |path| path.display().to_string())
+        ),
+        format!(
+            "Git branch       {}",
+            context.git_branch.as_deref().unwrap_or("unknown")
+        ),
+        format!("Git state        {}", context.git_summary.headline()),
+        format!("Changed files    {}", context.git_summary.changed_files),
+        format!(
+            "Memory files     {} · config files loaded {}/{}",
+            context.memory_file_count, context.loaded_config_files, context.discovered_config_files
+        ),
+    ])
+}
+
+fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
+    let degraded = status.enabled && !status.active;
+    let mut details = vec![
+        format!("Enabled          {}", status.enabled),
+        format!("Active           {}", status.active),
+        format!("Supported        {}", status.supported),
+        format!("Filesystem mode  {}", status.filesystem_mode.as_str()),
+        format!("Filesystem live  {}", status.filesystem_active),
+    ];
+    if let Some(reason) = &status.fallback_reason {
+        details.push(format!("Fallback reason  {reason}"));
+    }
+    DiagnosticCheck::new(
+        "Sandbox",
+        if degraded {
+            DiagnosticLevel::Warn
+        } else {
+            DiagnosticLevel::Ok
+        },
+        if degraded {
+            "sandbox was requested but is not currently active"
+        } else if status.active {
+            "sandbox protections are active"
+        } else {
+            "sandbox is not active for this session"
+        },
+    )
+    .with_details(details)
+}
+
+fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
+    let mut details = vec![
+        format!("OS               {} {}", env::consts::OS, env::consts::ARCH),
+        format!("Working dir      {}", cwd.display()),
+        format!("Version          {}", VERSION),
+        format!("Build target     {}", BUILD_TARGET.unwrap_or("<unknown>")),
+        format!("Git SHA          {}", GIT_SHA.unwrap_or("<unknown>")),
+    ];
+    if let Some(model) = config.and_then(runtime::RuntimeConfig::model) {
+        details.push(format!("Default model    {model}"));
+    }
+    DiagnosticCheck::new(
+        "System",
+        DiagnosticLevel::Ok,
+        "captured local runtime metadata",
+    )
+    .with_details(details)
 }
 
 fn resume_command_can_absorb_token(current_command: &str, token: &str) -> bool {
@@ -1468,6 +1891,10 @@ fn run_resume_command(
                 message: Some(handle_skills_slash_command(args.as_deref(), &cwd)?),
             })
         }
+        SlashCommand::Doctor => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_doctor_report()?.render()),
+        }),
         SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
         SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
@@ -1481,7 +1908,6 @@ fn run_resume_command(
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
-        | SlashCommand::Doctor
         | SlashCommand::Login
         | SlashCommand::Logout
         | SlashCommand::Vim
@@ -1751,37 +2177,38 @@ impl RuntimeMcpState {
             .into_iter()
             .filter(|server_name| !failed_server_names.contains(server_name))
             .collect::<Vec<_>>();
-        let failed_servers = discovery
-            .failed_servers
-            .iter()
-            .map(|failure| runtime::McpFailedServer {
-                server_name: failure.server_name.clone(),
-                phase: runtime::McpLifecyclePhase::ToolDiscovery,
-                error: runtime::McpErrorSurface::new(
-                    runtime::McpLifecyclePhase::ToolDiscovery,
-                    Some(failure.server_name.clone()),
-                    failure.error.clone(),
-                    std::collections::BTreeMap::new(),
-                    true,
-                ),
-            })
-            .chain(discovery.unsupported_servers.iter().map(|server| {
-                runtime::McpFailedServer {
-                    server_name: server.server_name.clone(),
-                    phase: runtime::McpLifecyclePhase::ServerRegistration,
+        let failed_servers =
+            discovery
+                .failed_servers
+                .iter()
+                .map(|failure| runtime::McpFailedServer {
+                    server_name: failure.server_name.clone(),
+                    phase: runtime::McpLifecyclePhase::ToolDiscovery,
                     error: runtime::McpErrorSurface::new(
-                        runtime::McpLifecyclePhase::ServerRegistration,
-                        Some(server.server_name.clone()),
-                        server.reason.clone(),
-                        std::collections::BTreeMap::from([(
-                            "transport".to_string(),
-                            format!("{:?}", server.transport).to_ascii_lowercase(),
-                        )]),
-                        false,
+                        runtime::McpLifecyclePhase::ToolDiscovery,
+                        Some(failure.server_name.clone()),
+                        failure.error.clone(),
+                        std::collections::BTreeMap::new(),
+                        true,
                     ),
-                }
-            }))
-            .collect::<Vec<_>>();
+                })
+                .chain(discovery.unsupported_servers.iter().map(|server| {
+                    runtime::McpFailedServer {
+                        server_name: server.server_name.clone(),
+                        phase: runtime::McpLifecyclePhase::ServerRegistration,
+                        error: runtime::McpErrorSurface::new(
+                            runtime::McpLifecyclePhase::ServerRegistration,
+                            Some(server.server_name.clone()),
+                            server.reason.clone(),
+                            std::collections::BTreeMap::from([(
+                                "transport".to_string(),
+                                format!("{:?}", server.transport).to_ascii_lowercase(),
+                            )]),
+                            false,
+                        ),
+                    }
+                }))
+                .collect::<Vec<_>>();
         let degraded_report = (!failed_servers.is_empty()).then(|| {
             runtime::McpDegradedReport::new(
                 working_servers,
@@ -2387,8 +2814,11 @@ impl LiveCli {
                 Self::print_skills(args.as_deref())?;
                 false
             }
-            SlashCommand::Doctor
-            | SlashCommand::Login
+            SlashCommand::Doctor => {
+                println!("{}", render_doctor_report()?.render());
+                false
+            }
+            SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
             | SlashCommand::Upgrade
@@ -3369,6 +3799,33 @@ fn print_sandbox_status_snapshot() -> Result<(), Box<dyn std::error::Error>> {
         format_sandbox_report(&resolve_sandbox_status(runtime_config.sandbox(), &cwd))
     );
     Ok(())
+}
+
+fn render_help_topic(topic: LocalHelpTopic) -> String {
+    match topic {
+        LocalHelpTopic::Status => "Status
+  Usage            claw status
+  Purpose          show the local workspace snapshot without entering the REPL
+  Output           model, permissions, git state, config files, and sandbox status
+  Related          /status · claw --resume latest /status"
+            .to_string(),
+        LocalHelpTopic::Sandbox => "Sandbox
+  Usage            claw sandbox
+  Purpose          inspect the resolved sandbox and isolation state for the current directory
+  Output           namespace, network, filesystem, and fallback details
+  Related          /sandbox · claw status"
+            .to_string(),
+        LocalHelpTopic::Doctor => "Doctor
+  Usage            claw doctor
+  Purpose          diagnose local auth, config, workspace, sandbox, and build metadata
+  Output           local-only health report; no provider request or session resume required
+  Related          /doctor · claw --resume latest /doctor"
+            .to_string(),
+    }
+}
+
+fn print_help_topic(topic: LocalHelpTopic) {
+    println!("{}", render_help_topic(topic));
 }
 
 fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
@@ -5549,6 +6006,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out, "  claw sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
+    writeln!(out, "  claw doctor")?;
+    writeln!(
+        out,
+        "      Diagnose local auth, config, workspace, and sandbox health"
+    )?;
     writeln!(out, "  claw dump-manifests")?;
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw agents")?;
@@ -5626,6 +6088,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp show my-server")?;
     writeln!(out, "  claw /skills")?;
+    writeln!(out, "  claw doctor")?;
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw init")?;
     Ok(())
@@ -5654,8 +6117,8 @@ mod tests {
         resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, SlashCommand,
-        StatusUsage, DEFAULT_MODEL,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -6022,6 +6485,10 @@ mod tests {
             CliAction::Logout
         );
         assert_eq!(
+            parse_args(&["doctor".to_string()]).expect("doctor should parse"),
+            CliAction::Doctor
+        );
+        assert_eq!(
             parse_args(&["init".to_string()]).expect("init should parse"),
             CliAction::Init
         );
@@ -6043,6 +6510,25 @@ mod tests {
             CliAction::Agents {
                 args: Some("--help".to_string())
             }
+        );
+    }
+
+    #[test]
+    fn local_command_help_flags_stay_on_the_local_parser_path() {
+        assert_eq!(
+            parse_args(&["status".to_string(), "--help".to_string()])
+                .expect("status help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Status)
+        );
+        assert_eq!(
+            parse_args(&["sandbox".to_string(), "-h".to_string()])
+                .expect("sandbox help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Sandbox)
+        );
+        assert_eq!(
+            parse_args(&["doctor".to_string(), "--help".to_string()])
+                .expect("doctor help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Doctor)
         );
     }
 
@@ -7509,8 +7995,12 @@ UU conflicted.rs",
         let runtime_config = loader.load().expect("runtime config should load");
         let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
             .expect("runtime plugin state should load");
-        let mut executor =
-            CliToolExecutor::new(None, false, state.tool_registry.clone(), state.mcp_state.clone());
+        let mut executor = CliToolExecutor::new(
+            None,
+            false,
+            state.tool_registry.clone(),
+            state.mcp_state.clone(),
+        );
 
         let search_output = executor
             .execute("ToolSearch", r#"{"query":"remote","max_results":5}"#)
