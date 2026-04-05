@@ -3347,8 +3347,8 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
         "usage": {
             "slash_command": "/skills [list|install <path>|help]",
             "direct_cli": "claw skills [list|install <path>|help]",
-            "install_root": "$CODEX_HOME/skills or ~/.codex/skills",
-            "sources": [".codex/skills", ".claude/skills", "legacy /commands"],
+            "install_root": "$CLAW_CONFIG_HOME/skills or ~/.claw/skills",
+            "sources": [".claw/skills", "legacy /commands", "legacy fallback dirs still load automatically"],
         },
         "unexpected": unexpected,
     })
@@ -3458,11 +3458,15 @@ fn format_mcp_oauth(oauth: Option<&McpOAuthConfig>) -> String {
 
 fn definition_source_id(source: DefinitionSource) -> &'static str {
     match source {
-        DefinitionSource::ProjectCodex => "project_codex",
-        DefinitionSource::ProjectClaude => "project_claude",
-        DefinitionSource::UserCodexHome => "user_codex_home",
-        DefinitionSource::UserCodex => "user_codex",
-        DefinitionSource::UserClaude => "user_claude",
+        DefinitionSource::ProjectClaw
+        | DefinitionSource::ProjectCodex
+        | DefinitionSource::ProjectClaude => "project_claw",
+        DefinitionSource::UserClawConfigHome | DefinitionSource::UserCodexHome => {
+            "user_claw_config_home"
+        }
+        DefinitionSource::UserClaw | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
+            "user_claw"
+        }
     }
 }
 
@@ -4442,10 +4446,10 @@ mod tests {
         assert_eq!(report["summary"]["active"], 3);
         assert_eq!(report["summary"]["shadowed"], 1);
         assert_eq!(report["skills"][0]["name"], "plan");
-        assert_eq!(report["skills"][0]["source"]["id"], "project_codex");
+        assert_eq!(report["skills"][0]["source"]["id"], "project_claw");
         assert_eq!(report["skills"][1]["name"], "deploy");
         assert_eq!(report["skills"][1]["origin"]["id"], "legacy_commands_dir");
-        assert_eq!(report["skills"][3]["shadowed_by"]["id"], "project_codex");
+        assert_eq!(report["skills"][3]["shadowed_by"]["id"], "project_claw");
 
         let help = handle_skills_slash_command_json(Some("help"), &workspace).expect("skills help");
         assert_eq!(help["kind"], "skills");

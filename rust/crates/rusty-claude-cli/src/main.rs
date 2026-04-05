@@ -129,8 +129,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Status {
             model,
             permission_mode,
-        } => print_status_snapshot(&model, permission_mode)?,
-        CliAction::Sandbox => print_sandbox_status_snapshot()?,
+            output_format,
+        } => print_status_snapshot(&model, permission_mode, output_format)?,
+        CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
         CliAction::Prompt {
             prompt,
             model,
@@ -181,8 +182,11 @@ enum CliAction {
     Status {
         model: String,
         permission_mode: PermissionMode,
+        output_format: CliOutputFormat,
     },
-    Sandbox,
+    Sandbox {
+        output_format: CliOutputFormat,
+    },
     Prompt {
         prompt: String,
         model: String,
@@ -365,7 +369,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     if let Some(action) = parse_local_help_action(&rest) {
         return action;
     }
-    if let Some(action) = parse_single_word_command_alias(&rest, &model, permission_mode_override) {
+    if let Some(action) = parse_single_word_command_alias(&rest, &model, permission_mode_override, output_format) {
         return action;
     }
 
@@ -435,6 +439,7 @@ fn parse_single_word_command_alias(
     rest: &[String],
     model: &str,
     permission_mode_override: Option<PermissionMode>,
+    output_format: CliOutputFormat,
 ) -> Option<Result<CliAction, String>> {
     if rest.len() != 1 {
         return None;
@@ -446,8 +451,9 @@ fn parse_single_word_command_alias(
         "status" => Some(Ok(CliAction::Status {
             model: model.to_string(),
             permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
+            output_format,
         })),
-        "sandbox" => Some(Ok(CliAction::Sandbox)),
+        "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor)),
         other => bare_slash_command_guidance(other).map(Err),
     }
@@ -1862,13 +1868,7 @@ fn run_resume_command(
             };
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(match output_format {
-                    CliOutputFormat::Text => json!({
-                        "kind": "mcp",
-                        "message": handle_mcp_slash_command(args.as_deref(), &cwd)?,
-                    }),
-                    CliOutputFormat::Json => handle_mcp_slash_command_json(args.as_deref(), &cwd)?,
-                }),
+                message: Some(handle_mcp_slash_command(args.as_deref(), &cwd)?),
             })
         }
         SlashCommand::Memory => Ok(ResumeCommandOutcome {
@@ -1912,15 +1912,7 @@ fn run_resume_command(
             let cwd = env::current_dir()?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(match output_format {
-                    CliOutputFormat::Text => json!({
-                        "kind": "skills",
-                        "message": handle_skills_slash_command(args.as_deref(), &cwd)?,
-                    }),
-                    CliOutputFormat::Json => {
-                        handle_skills_slash_command_json(args.as_deref(), &cwd)?
-                    }
-                }),
+                message: Some(handle_skills_slash_command(args.as_deref(), &cwd)?),
             })
         }
         SlashCommand::Doctor => Ok(ResumeCommandOutcome {
@@ -3136,7 +3128,7 @@ impl LiveCli {
             CliOutputFormat::Text => println!("{}", handle_mcp_slash_command(args, &cwd)?),
             CliOutputFormat::Json => println!(
                 "{}",
-                serialize_json_output(&handle_mcp_slash_command_json(args, &cwd)?)?
+                serde_json::to_string_pretty(&handle_mcp_slash_command_json(args, &cwd)?)?
             ),
         }
         Ok(())
@@ -3151,7 +3143,7 @@ impl LiveCli {
             CliOutputFormat::Text => println!("{}", handle_skills_slash_command(args, &cwd)?),
             CliOutputFormat::Json => println!(
                 "{}",
-                serialize_json_output(&handle_skills_slash_command_json(args, &cwd)?)?
+                serde_json::to_string_pretty(&handle_skills_slash_command_json(args, &cwd)?)?
             ),
         }
         Ok(())
@@ -3659,22 +3651,68 @@ fn render_repl_help() -> String {
 fn print_status_snapshot(
     model: &str,
     permission_mode: PermissionMode,
+    output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!(
-        "{}",
-        format_status_report(
-            model,
-            StatusUsage {
-                message_count: 0,
-                turns: 0,
-                latest: TokenUsage::default(),
-                cumulative: TokenUsage::default(),
-                estimated_tokens: 0,
-            },
-            permission_mode.as_str(),
-            &status_context(None)?,
-        )
-    );
+    let usage = StatusUsage {
+        message_count: 0,
+        turns: 0,
+        latest: TokenUsage::default(),
+        cumulative: TokenUsage::default(),
+        estimated_tokens: 0,
+    };
+    let context = status_context(None)?;
+    match output_format {
+        CliOutputFormat::Text => println!(
+            "{}",
+            format_status_report(model, usage, permission_mode.as_str(), &context)
+        ),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "status",
+                "model": model,
+                "permission_mode": permission_mode.as_str(),
+                "usage": {
+                    "messages": usage.message_count,
+                    "turns": usage.turns,
+                    "latest_total": usage.latest.total_tokens(),
+                    "cumulative_input": usage.cumulative.input_tokens,
+                    "cumulative_output": usage.cumulative.output_tokens,
+                    "cumulative_total": usage.cumulative.total_tokens(),
+                    "estimated_tokens": usage.estimated_tokens,
+                },
+                "workspace": {
+                    "cwd": context.cwd,
+                    "project_root": context.project_root,
+                    "git_branch": context.git_branch,
+                    "git_state": context.git_summary.headline(),
+                    "changed_files": context.git_summary.changed_files,
+                    "staged_files": context.git_summary.staged_files,
+                    "unstaged_files": context.git_summary.unstaged_files,
+                    "untracked_files": context.git_summary.untracked_files,
+                    "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
+                    "loaded_config_files": context.loaded_config_files,
+                    "discovered_config_files": context.discovered_config_files,
+                    "memory_file_count": context.memory_file_count,
+                },
+                "sandbox": {
+                    "enabled": context.sandbox_status.enabled,
+                    "active": context.sandbox_status.active,
+                    "supported": context.sandbox_status.supported,
+                    "in_container": context.sandbox_status.in_container,
+                    "requested_namespace": context.sandbox_status.requested.namespace_restrictions,
+                    "active_namespace": context.sandbox_status.namespace_active,
+                    "requested_network": context.sandbox_status.requested.network_isolation,
+                    "active_network": context.sandbox_status.network_active,
+                    "filesystem_mode": context.sandbox_status.filesystem_mode.as_str(),
+                    "filesystem_active": context.sandbox_status.filesystem_active,
+                    "allowed_mounts": context.sandbox_status.allowed_mounts,
+                    "markers": context.sandbox_status.container_markers,
+                    "fallback_reason": context.sandbox_status.fallback_reason,
+                }
+            }))?
+        ),
+    }
     Ok(())
 }
 
@@ -3838,16 +3876,37 @@ fn format_commit_skipped_report() -> String {
         .to_string()
 }
 
-fn print_sandbox_status_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+fn print_sandbox_status_snapshot(
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader
         .load()
         .unwrap_or_else(|_| runtime::RuntimeConfig::empty());
-    println!(
-        "{}",
-        format_sandbox_report(&resolve_sandbox_status(runtime_config.sandbox(), &cwd))
-    );
+    let status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
+    match output_format {
+        CliOutputFormat::Text => println!("{}", format_sandbox_report(&status)),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "sandbox",
+                "enabled": status.enabled,
+                "active": status.active,
+                "supported": status.supported,
+                "in_container": status.in_container,
+                "requested_namespace": status.requested.namespace_restrictions,
+                "active_namespace": status.namespace_active,
+                "requested_network": status.requested.network_isolation,
+                "active_network": status.network_active,
+                "filesystem_mode": status.filesystem_mode.as_str(),
+                "filesystem_active": status.filesystem_active,
+                "allowed_mounts": status.allowed_mounts,
+                "markers": status.container_markers,
+                "fallback_reason": status.fallback_reason,
+            }))?
+        ),
+    }
     Ok(())
 }
 
@@ -6605,11 +6664,14 @@ mod tests {
             CliAction::Status {
                 model: DEFAULT_MODEL.to_string(),
                 permission_mode: PermissionMode::DangerFullAccess,
+                output_format: CliOutputFormat::Text,
             }
         );
         assert_eq!(
             parse_args(&["sandbox".to_string()]).expect("sandbox should parse"),
-            CliAction::Sandbox
+            CliAction::Sandbox {
+                output_format: CliOutputFormat::Text,
+            }
         );
     }
 
