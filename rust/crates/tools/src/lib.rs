@@ -2976,15 +2976,21 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
     }
 
     let mut candidates = Vec::new();
+    if let Ok(claw_config_home) = std::env::var("CLAW_CONFIG_HOME") {
+        candidates.push(std::path::PathBuf::from(claw_config_home).join("skills"));
+    }
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         candidates.push(std::path::PathBuf::from(codex_home).join("skills"));
     }
     if let Ok(home) = std::env::var("HOME") {
         let home = std::path::PathBuf::from(home);
+        candidates.push(home.join(".claw").join("skills"));
         candidates.push(home.join(".agents").join("skills"));
         candidates.push(home.join(".config").join("opencode").join("skills"));
         candidates.push(home.join(".codex").join("skills"));
+        candidates.push(home.join(".claude").join("skills"));
     }
+    candidates.push(std::path::PathBuf::from("/home/bellman/.claw/skills"));
     candidates.push(std::path::PathBuf::from("/home/bellman/.codex/skills"));
 
     for root in candidates {
