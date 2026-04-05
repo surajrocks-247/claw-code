@@ -303,6 +303,9 @@ Priority order: P0 = blocks CI/green state, P1 = blocks integration wiring, P2 =
 14. **Config merge validation gap** — **done**: `config.rs` hook validation before deep-merge (+56 lines), malformed entries fail with source-path context instead of merged parse errors
 15. **MCP manager discovery flaky test** — `manager_discovery_report_keeps_healthy_servers_when_one_server_fails` has intermittent timing issues in CI; temporarily ignored, needs root cause fix
 
+16. **Commit provenance / worktree-aware push events** — clawhip build stream shows duplicate-looking commit messages and worktree-originated pushes without clear supersession indicators; add worktree/branch metadata to push events and de-dup superseded commits in build stream display
+17. **Orphaned module integration audit** — `session_control` is `pub mod` exported from `runtime` but has zero consumers across the entire workspace (no import, no call site outside its own file). `trust_resolver` types are re-exported from `lib.rs` but never instantiated outside unit tests. These modules implement core clawability contracts (session management, trust resolution) that are structurally dead — built but not wired into the CLI or tools crate. **Action:** audit all `pub mod` / `pub use` exports from `runtime` for actual call sites; either wire orphaned modules into the real execution path or demote to `pub(crate)` / `cfg(test)` to prevent false clawability surface.
+
 **P3 — Swarm efficiency**
 13. Swarm branch-lock protocol — detect same-module/same-branch collision before parallel workers drift into duplicate implementation
 14. Commit provenance / worktree-aware push events — emit branch, worktree, superseded-by, and canonical commit lineage so parallel sessions stop producing duplicate-looking push summaries
