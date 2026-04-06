@@ -51,7 +51,7 @@ use runtime::{
     Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
@@ -870,6 +870,7 @@ struct DiagnosticCheck {
     level: DiagnosticLevel,
     summary: String,
     details: Vec<String>,
+    data: Map<String, Value>,
 }
 
 impl DiagnosticCheck {
@@ -879,12 +880,44 @@ impl DiagnosticCheck {
             level,
             summary: summary.into(),
             details: Vec::new(),
+            data: Map::new(),
         }
     }
 
     fn with_details(mut self, details: Vec<String>) -> Self {
         self.details = details;
         self
+    }
+
+    fn with_data(mut self, data: Map<String, Value>) -> Self {
+        self.data = data;
+        self
+    }
+
+    fn json_value(&self) -> Value {
+        let mut value = Map::from_iter([
+            (
+                "name".to_string(),
+                Value::String(self.name.to_ascii_lowercase()),
+            ),
+            (
+                "status".to_string(),
+                Value::String(self.level.label().to_string()),
+            ),
+            ("summary".to_string(), Value::String(self.summary.clone())),
+            (
+                "details".to_string(),
+                Value::Array(
+                    self.details
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+        ]);
+        value.extend(self.data.clone());
+        Value::Object(value)
     }
 }
 
@@ -894,26 +927,29 @@ struct DoctorReport {
 }
 
 impl DoctorReport {
+    fn counts(&self) -> (usize, usize, usize) {
+        (
+            self.checks
+                .iter()
+                .filter(|check| check.level == DiagnosticLevel::Ok)
+                .count(),
+            self.checks
+                .iter()
+                .filter(|check| check.level == DiagnosticLevel::Warn)
+                .count(),
+            self.checks
+                .iter()
+                .filter(|check| check.level == DiagnosticLevel::Fail)
+                .count(),
+        )
+    }
+
     fn has_failures(&self) -> bool {
         self.checks.iter().any(|check| check.level.is_failure())
     }
 
     fn render(&self) -> String {
-        let ok_count = self
-            .checks
-            .iter()
-            .filter(|check| check.level == DiagnosticLevel::Ok)
-            .count();
-        let warn_count = self
-            .checks
-            .iter()
-            .filter(|check| check.level == DiagnosticLevel::Warn)
-            .count();
-        let fail_count = self
-            .checks
-            .iter()
-            .filter(|check| check.level == DiagnosticLevel::Fail)
-            .count();
+        let (ok_count, warn_count, fail_count) = self.counts();
         let mut lines = vec![
             "Doctor".to_string(),
             format!(
@@ -922,6 +958,28 @@ impl DoctorReport {
         ];
         lines.extend(self.checks.iter().map(render_diagnostic_check));
         lines.join("\n\n")
+    }
+
+    fn json_value(&self) -> Value {
+        let report = self.render();
+        let (ok_count, warn_count, fail_count) = self.counts();
+        json!({
+            "kind": "doctor",
+            "message": report,
+            "report": report,
+            "has_failures": self.has_failures(),
+            "summary": {
+                "total": self.checks.len(),
+                "ok": ok_count,
+                "warnings": warn_count,
+                "failures": fail_count,
+            },
+            "checks": self
+                .checks
+                .iter()
+                .map(DiagnosticCheck::json_value)
+                .collect::<Vec<_>>(),
+        })
     }
 }
 
@@ -980,15 +1038,9 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     let message = report.render();
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
-        CliOutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "doctor",
-                "message": message,
-                "report": message,
-                "has_failures": report.has_failures(),
-            }))?
-        ),
+        CliOutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report.json_value())?);
+        }
     }
     if report.has_failures() {
         return Err("doctor found failing checks".into());
@@ -996,6 +1048,7 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn check_auth_health() -> DiagnosticCheck {
     let api_key_present = env::var("ANTHROPIC_API_KEY")
         .ok()
@@ -1060,6 +1113,21 @@ fn check_auth_health() -> DiagnosticCheck {
                 },
             )
             .with_details(details)
+            .with_data(Map::from_iter([
+                ("api_key_present".to_string(), json!(api_key_present)),
+                ("auth_token_present".to_string(), json!(auth_token_present)),
+                ("saved_oauth_present".to_string(), json!(true)),
+                ("saved_oauth_expired".to_string(), json!(expired)),
+                (
+                    "saved_oauth_expires_at".to_string(),
+                    json!(token_set.expires_at),
+                ),
+                (
+                    "refresh_token_present".to_string(),
+                    json!(token_set.refresh_token.is_some()),
+                ),
+                ("scopes".to_string(), json!(token_set.scopes)),
+            ]))
         }
         Ok(None) => DiagnosticCheck::new(
             "Auth",
@@ -1082,12 +1150,31 @@ fn check_auth_health() -> DiagnosticCheck {
             } else {
                 "absent"
             }
-        )]),
+        )])
+        .with_data(Map::from_iter([
+            ("api_key_present".to_string(), json!(api_key_present)),
+            ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("saved_oauth_present".to_string(), json!(false)),
+            ("saved_oauth_expired".to_string(), json!(false)),
+            ("saved_oauth_expires_at".to_string(), Value::Null),
+            ("refresh_token_present".to_string(), json!(false)),
+            ("scopes".to_string(), json!(Vec::<String>::new())),
+        ])),
         Err(error) => DiagnosticCheck::new(
             "Auth",
             DiagnosticLevel::Fail,
             format!("failed to inspect saved credentials: {error}"),
-        ),
+        )
+        .with_data(Map::from_iter([
+            ("api_key_present".to_string(), json!(api_key_present)),
+            ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("saved_oauth_present".to_string(), Value::Null),
+            ("saved_oauth_expired".to_string(), Value::Null),
+            ("saved_oauth_expires_at".to_string(), Value::Null),
+            ("refresh_token_present".to_string(), Value::Null),
+            ("scopes".to_string(), Value::Null),
+            ("saved_oauth_error".to_string(), json!(error.to_string())),
+        ])),
     }
 }
 
@@ -1121,7 +1208,7 @@ fn check_config_health(
             } else {
                 details.extend(
                     discovered_paths
-                        .into_iter()
+                        .iter()
                         .map(|path| format!("Discovered file   {path}")),
                 );
             }
@@ -1139,6 +1226,22 @@ fn check_config_health(
                 },
             )
             .with_details(details)
+            .with_data(Map::from_iter([
+                ("discovered_files".to_string(), json!(discovered_paths)),
+                (
+                    "discovered_files_count".to_string(),
+                    json!(discovered_count),
+                ),
+                (
+                    "loaded_config_files".to_string(),
+                    json!(loaded_entries.len()),
+                ),
+                ("resolved_model".to_string(), json!(runtime_config.model())),
+                (
+                    "mcp_servers".to_string(),
+                    json!(runtime_config.mcp().servers().len()),
+                ),
+            ]))
         }
         Err(error) => DiagnosticCheck::new(
             "Config",
@@ -1149,10 +1252,21 @@ fn check_config_health(
             vec!["Discovered files  <none>".to_string()]
         } else {
             discovered_paths
-                .into_iter()
+                .iter()
                 .map(|path| format!("Discovered file   {path}"))
                 .collect()
-        }),
+        })
+        .with_data(Map::from_iter([
+            ("discovered_files".to_string(), json!(discovered_paths)),
+            (
+                "discovered_files_count".to_string(),
+                json!(discovered_count),
+            ),
+            ("loaded_config_files".to_string(), json!(0)),
+            ("resolved_model".to_string(), Value::Null),
+            ("mcp_servers".to_string(), Value::Null),
+            ("load_error".to_string(), json!(error.to_string())),
+        ])),
     }
 }
 
@@ -1194,6 +1308,38 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
             context.memory_file_count, context.loaded_config_files, context.discovered_config_files
         ),
     ])
+    .with_data(Map::from_iter([
+        ("cwd".to_string(), json!(context.cwd.display().to_string())),
+        (
+            "project_root".to_string(),
+            json!(context
+                .project_root
+                .as_ref()
+                .map(|path| path.display().to_string())),
+        ),
+        ("in_git_repo".to_string(), json!(in_repo)),
+        ("git_branch".to_string(), json!(context.git_branch)),
+        (
+            "git_state".to_string(),
+            json!(context.git_summary.headline()),
+        ),
+        (
+            "changed_files".to_string(),
+            json!(context.git_summary.changed_files),
+        ),
+        (
+            "memory_file_count".to_string(),
+            json!(context.memory_file_count),
+        ),
+        (
+            "loaded_config_files".to_string(),
+            json!(context.loaded_config_files),
+        ),
+        (
+            "discovered_config_files".to_string(),
+            json!(context.discovered_config_files),
+        ),
+    ]))
 }
 
 fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
@@ -1224,9 +1370,43 @@ fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
         },
     )
     .with_details(details)
+    .with_data(Map::from_iter([
+        ("enabled".to_string(), json!(status.enabled)),
+        ("active".to_string(), json!(status.active)),
+        ("supported".to_string(), json!(status.supported)),
+        (
+            "namespace_supported".to_string(),
+            json!(status.namespace_supported),
+        ),
+        (
+            "namespace_active".to_string(),
+            json!(status.namespace_active),
+        ),
+        (
+            "network_supported".to_string(),
+            json!(status.network_supported),
+        ),
+        ("network_active".to_string(), json!(status.network_active)),
+        (
+            "filesystem_mode".to_string(),
+            json!(status.filesystem_mode.as_str()),
+        ),
+        (
+            "filesystem_active".to_string(),
+            json!(status.filesystem_active),
+        ),
+        ("allowed_mounts".to_string(), json!(status.allowed_mounts)),
+        ("in_container".to_string(), json!(status.in_container)),
+        (
+            "container_markers".to_string(),
+            json!(status.container_markers),
+        ),
+        ("fallback_reason".to_string(), json!(status.fallback_reason)),
+    ]))
 }
 
 fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
+    let default_model = config.and_then(runtime::RuntimeConfig::model);
     let mut details = vec![
         format!("OS               {} {}", env::consts::OS, env::consts::ARCH),
         format!("Working dir      {}", cwd.display()),
@@ -1234,7 +1414,7 @@ fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> D
         format!("Build target     {}", BUILD_TARGET.unwrap_or("<unknown>")),
         format!("Git SHA          {}", GIT_SHA.unwrap_or("<unknown>")),
     ];
-    if let Some(model) = config.and_then(runtime::RuntimeConfig::model) {
+    if let Some(model) = default_model {
         details.push(format!("Default model    {model}"));
     }
     DiagnosticCheck::new(
@@ -1243,6 +1423,15 @@ fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> D
         "captured local runtime metadata",
     )
     .with_details(details)
+    .with_data(Map::from_iter([
+        ("os".to_string(), json!(env::consts::OS)),
+        ("arch".to_string(), json!(env::consts::ARCH)),
+        ("working_dir".to_string(), json!(cwd.display().to_string())),
+        ("version".to_string(), json!(VERSION)),
+        ("build_target".to_string(), json!(BUILD_TARGET)),
+        ("git_sha".to_string(), json!(GIT_SHA)),
+        ("default_model".to_string(), json!(default_model)),
+    ]))
 }
 
 fn resume_command_can_absorb_token(current_command: &str, token: &str) -> bool {

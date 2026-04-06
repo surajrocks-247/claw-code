@@ -200,6 +200,41 @@ fn doctor_and_resume_status_emit_json_when_requested() {
     let doctor = assert_json_command(&root, &["--output-format", "json", "doctor"]);
     assert_eq!(doctor["kind"], "doctor");
     assert!(doctor["message"].is_string());
+    let summary = doctor["summary"].as_object().expect("doctor summary");
+    assert!(summary["ok"].as_u64().is_some());
+    assert!(summary["warnings"].as_u64().is_some());
+    assert!(summary["failures"].as_u64().is_some());
+
+    let checks = doctor["checks"].as_array().expect("doctor checks");
+    assert_eq!(checks.len(), 5);
+    let check_names = checks
+        .iter()
+        .map(|check| {
+            assert!(check["status"].as_str().is_some());
+            assert!(check["summary"].as_str().is_some());
+            assert!(check["details"].is_array());
+            check["name"].as_str().expect("doctor check name")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        check_names,
+        vec!["auth", "config", "workspace", "sandbox", "system"]
+    );
+
+    let workspace = checks
+        .iter()
+        .find(|check| check["name"] == "workspace")
+        .expect("workspace check");
+    assert!(workspace["cwd"].as_str().is_some());
+    assert!(workspace["in_git_repo"].is_boolean());
+
+    let sandbox = checks
+        .iter()
+        .find(|check| check["name"] == "sandbox")
+        .expect("sandbox check");
+    assert!(sandbox["filesystem_mode"].as_str().is_some());
+    assert!(sandbox["enabled"].is_boolean());
+    assert!(sandbox["fallback_reason"].is_null() || sandbox["fallback_reason"].is_string());
 
     let session_path = root.join("session.jsonl");
     fs::write(
