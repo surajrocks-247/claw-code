@@ -50,8 +50,34 @@ fn inventory_commands_emit_structured_json_when_requested() {
     let root = unique_temp_dir("inventory-json");
     fs::create_dir_all(&root).expect("temp dir should exist");
 
-    let agents = assert_json_command(&root, &["--output-format", "json", "agents"]);
+    let isolated_home = root.join("home");
+    let isolated_config = root.join("config-home");
+    let isolated_codex = root.join("codex-home");
+    fs::create_dir_all(&isolated_home).expect("isolated home should exist");
+
+    let agents = assert_json_command_with_env(
+        &root,
+        &["--output-format", "json", "agents"],
+        &[
+            ("HOME", isolated_home.to_str().expect("utf8 home")),
+            (
+                "CLAW_CONFIG_HOME",
+                isolated_config.to_str().expect("utf8 config home"),
+            ),
+            (
+                "CODEX_HOME",
+                isolated_codex.to_str().expect("utf8 codex home"),
+            ),
+        ],
+    );
     assert_eq!(agents["kind"], "agents");
+    assert_eq!(agents["action"], "list");
+    assert_eq!(agents["count"], 0);
+    assert_eq!(agents["summary"]["active"], 0);
+    assert!(agents["agents"]
+        .as_array()
+        .expect("agents array")
+        .is_empty());
 
     let mcp = assert_json_command(&root, &["--output-format", "json", "mcp"]);
     assert_eq!(mcp["kind"], "mcp");
@@ -60,6 +86,68 @@ fn inventory_commands_emit_structured_json_when_requested() {
     let skills = assert_json_command(&root, &["--output-format", "json", "skills"]);
     assert_eq!(skills["kind"], "skills");
     assert_eq!(skills["action"], "list");
+}
+
+#[test]
+fn agents_command_emits_structured_agent_entries_when_requested() {
+    let root = unique_temp_dir("agents-json-populated");
+    let workspace = root.join("workspace");
+    let project_agents = workspace.join(".codex").join("agents");
+    let home = root.join("home");
+    let user_agents = home.join(".codex").join("agents");
+    let isolated_config = root.join("config-home");
+    let isolated_codex = root.join("codex-home");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    write_agent(
+        &project_agents,
+        "planner",
+        "Project planner",
+        "gpt-5.4",
+        "medium",
+    );
+    write_agent(
+        &project_agents,
+        "verifier",
+        "Verification agent",
+        "gpt-5.4-mini",
+        "high",
+    );
+    write_agent(
+        &user_agents,
+        "planner",
+        "User planner",
+        "gpt-5.4-mini",
+        "high",
+    );
+
+    let parsed = assert_json_command_with_env(
+        &workspace,
+        &["--output-format", "json", "agents"],
+        &[
+            ("HOME", home.to_str().expect("utf8 home")),
+            (
+                "CLAW_CONFIG_HOME",
+                isolated_config.to_str().expect("utf8 config home"),
+            ),
+            (
+                "CODEX_HOME",
+                isolated_codex.to_str().expect("utf8 codex home"),
+            ),
+        ],
+    );
+
+    assert_eq!(parsed["kind"], "agents");
+    assert_eq!(parsed["action"], "list");
+    assert_eq!(parsed["count"], 3);
+    assert_eq!(parsed["summary"]["active"], 2);
+    assert_eq!(parsed["summary"]["shadowed"], 1);
+    assert_eq!(parsed["agents"][0]["name"], "planner");
+    assert_eq!(parsed["agents"][0]["source"]["id"], "project_claw");
+    assert_eq!(parsed["agents"][0]["active"], true);
+    assert_eq!(parsed["agents"][1]["name"], "verifier");
+    assert_eq!(parsed["agents"][2]["name"], "planner");
+    assert_eq!(parsed["agents"][2]["active"], false);
+    assert_eq!(parsed["agents"][2]["shadowed_by"]["id"], "project_claw");
 }
 
 #[test]
@@ -181,6 +269,17 @@ fn write_upstream_fixture(root: &Path) -> PathBuf {
     )
     .expect("cli fixture should write");
     upstream
+}
+
+fn write_agent(root: &Path, name: &str, description: &str, model: &str, reasoning: &str) {
+    fs::create_dir_all(root).expect("agent root should exist");
+    fs::write(
+        root.join(format!("{name}.toml")),
+        format!(
+            "name = \"{name}\"\ndescription = \"{description}\"\nmodel = \"{model}\"\nmodel_reasoning_effort = \"{reasoning}\"\n"
+        ),
+    )
+    .expect("agent fixture should write");
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

@@ -31,10 +31,10 @@ use api::{
 };
 
 use commands::{
-    handle_agents_slash_command, handle_mcp_slash_command, handle_mcp_slash_command_json,
-    handle_plugins_slash_command, handle_skills_slash_command, handle_skills_slash_command_json,
-    render_slash_command_help, resume_supported_slash_commands, slash_command_specs,
-    validate_slash_command_input, SlashCommand,
+    handle_agents_slash_command, handle_agents_slash_command_json, handle_mcp_slash_command,
+    handle_mcp_slash_command_json, handle_plugins_slash_command, handle_skills_slash_command,
+    handle_skills_slash_command_json, render_slash_command_help, resume_supported_slash_commands,
+    slash_command_specs, validate_slash_command_input, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -3276,16 +3276,11 @@ impl LiveCli {
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
-        let message = handle_agents_slash_command(args, &cwd)?;
         match output_format {
-            CliOutputFormat::Text => println!("{message}"),
+            CliOutputFormat::Text => println!("{}", handle_agents_slash_command(args, &cwd)?),
             CliOutputFormat::Json => println!(
                 "{}",
-                serde_json::to_string_pretty(&json!({
-                    "kind": "agents",
-                    "message": message,
-                    "args": args,
-                }))?
+                serde_json::to_string_pretty(&handle_agents_slash_command_json(args, &cwd)?)?
             ),
         }
         Ok(())
