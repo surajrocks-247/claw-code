@@ -7778,6 +7778,17 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
+        assert_eq!(
+            parse_args(&["/skills".to_string(), "/test".to_string()])
+                .expect("/skills /test should normalize to a single skill prompt prefix"),
+            CliAction::Prompt {
+                prompt: "$test".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: crate::default_permission_mode(),
+            }
+        );
         let error = parse_args(&["/status".to_string()])
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("interactive-only"));
