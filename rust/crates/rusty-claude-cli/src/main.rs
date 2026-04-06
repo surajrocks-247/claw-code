@@ -1688,21 +1688,23 @@ fn print_system_prompt(
 }
 
 fn print_version(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let report = render_version_report();
     match output_format {
-        CliOutputFormat::Text => println!("{report}"),
-        CliOutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "version",
-                "message": report,
-                "version": VERSION,
-                "git_sha": GIT_SHA,
-                "target": BUILD_TARGET,
-            }))?
-        ),
+        CliOutputFormat::Text => println!("{}", render_version_report()),
+        CliOutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&version_json_value())?);
+        }
     }
     Ok(())
+}
+
+fn version_json_value() -> serde_json::Value {
+    json!({
+        "kind": "version",
+        "message": render_version_report(),
+        "version": VERSION,
+        "git_sha": GIT_SHA,
+        "target": BUILD_TARGET,
+    })
 }
 
 fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
@@ -1752,33 +1754,21 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             Ok(ResumeCommandOutcome {
                 session: next_session,
                 message,
+                json,
             }) => {
                 session = next_session;
-                if let Some(message) = message {
-                    if output_format == CliOutputFormat::Json
-                        && matches!(command, SlashCommand::Status)
-                    {
-                        let tracker = UsageTracker::from_session(&session);
-                        let context = status_context(Some(&resolved_path)).expect("status context");
-                        let value = status_json_value(
-                            "restored-session",
-                            StatusUsage {
-                                message_count: session.messages.len(),
-                                turns: tracker.turns(),
-                                latest: tracker.current_turn_usage(),
-                                cumulative: tracker.cumulative_usage(),
-                                estimated_tokens: 0,
-                            },
-                            default_permission_mode().as_str(),
-                            &context,
-                        );
+                if output_format == CliOutputFormat::Json {
+                    if let Some(value) = json {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&value).expect("status json")
+                            serde_json::to_string_pretty(&value)
+                                .expect("resume command json output")
                         );
-                    } else {
+                    } else if let Some(message) = message {
                         println!("{message}");
                     }
+                } else if let Some(message) = message {
+                    println!("{message}");
                 }
             }
             Err(error) => {
@@ -1793,6 +1783,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
 struct ResumeCommandOutcome {
     session: Session,
     message: Option<String>,
+    json: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -2127,6 +2118,7 @@ fn run_resume_command(
         SlashCommand::Help => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_repl_help()),
+            json: None,
         }),
         SlashCommand::Compact => {
             let result = runtime::compact_session(
@@ -2143,6 +2135,7 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: result.compacted_session,
                 message: Some(format_compact_report(removed, kept, skipped)),
+                json: None,
             })
         }
         SlashCommand::Clear { confirm } => {
@@ -2152,6 +2145,7 @@ fn run_resume_command(
                     message: Some(
                         "clear: confirmation required; rerun with /clear --confirm".to_string(),
                     ),
+                    json: None,
                 });
             }
             let backup_path = write_session_clear_backup(session, session_path)?;
@@ -2167,11 +2161,13 @@ fn run_resume_command(
                     backup_path.display(),
                     session_path.display()
                 )),
+                json: None,
             })
         }
         SlashCommand::Status => {
             let tracker = UsageTracker::from_session(session);
             let usage = tracker.cumulative_usage();
+            let context = status_context(Some(session_path))?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format_status_report(
@@ -2184,7 +2180,19 @@ fn run_resume_command(
                         estimated_tokens: 0,
                     },
                     default_permission_mode().as_str(),
-                    &status_context(Some(session_path))?,
+                    &context,
+                )),
+                json: Some(status_json_value(
+                    "restored-session",
+                    StatusUsage {
+                        message_count: session.messages.len(),
+                        turns: tracker.turns(),
+                        latest: tracker.current_turn_usage(),
+                        cumulative: usage,
+                        estimated_tokens: 0,
+                    },
+                    default_permission_mode().as_str(),
+                    &context,
                 )),
             })
         }
@@ -2192,12 +2200,11 @@ fn run_resume_command(
             let cwd = env::current_dir()?;
             let loader = ConfigLoader::default_for(&cwd);
             let runtime_config = loader.load()?;
+            let status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(format_sandbox_report(&resolve_sandbox_status(
-                    runtime_config.sandbox(),
-                    &cwd,
-                ))),
+                message: Some(format_sandbox_report(&status)),
+                json: Some(sandbox_json_value(&status)),
             })
         }
         SlashCommand::Cost => {
@@ -2205,11 +2212,13 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format_cost_report(usage)),
+                json: None,
             })
         }
         SlashCommand::Config { section } => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_config_report(section.as_deref())?),
+            json: None,
         }),
         SlashCommand::Mcp { action, target } => {
             let cwd = env::current_dir()?;
@@ -2222,25 +2231,33 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(handle_mcp_slash_command(args.as_deref(), &cwd)?),
+                json: Some(handle_mcp_slash_command_json(args.as_deref(), &cwd)?),
             })
         }
         SlashCommand::Memory => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_memory_report()?),
+            json: None,
         }),
-        SlashCommand::Init => Ok(ResumeCommandOutcome {
-            session: session.clone(),
-            message: Some(init_claude_md()?),
-        }),
+        SlashCommand::Init => {
+            let message = init_claude_md()?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message.clone()),
+                json: Some(init_json_value(&message)),
+            })
+        }
         SlashCommand::Diff => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_diff_report_for(
                 session_path.parent().unwrap_or_else(|| Path::new(".")),
             )?),
+            json: None,
         }),
         SlashCommand::Version => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_version_report()),
+            json: Some(version_json_value()),
         }),
         SlashCommand::Export { path } => {
             let export_path = resolve_export_path(path.as_deref(), session)?;
@@ -2252,6 +2269,7 @@ fn run_resume_command(
                     export_path.display(),
                     session.messages.len(),
                 )),
+                json: None,
             })
         }
         SlashCommand::Agents { args } => {
@@ -2259,6 +2277,7 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(handle_agents_slash_command(args.as_deref(), &cwd)?),
+                json: None,
             })
         }
         SlashCommand::Skills { args } => {
@@ -2266,11 +2285,13 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(handle_skills_slash_command(args.as_deref(), &cwd)?),
+                json: Some(handle_skills_slash_command_json(args.as_deref(), &cwd)?),
             })
         }
         SlashCommand::Doctor => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_doctor_report()?.render()),
+            json: None,
         }),
         SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
         SlashCommand::Bughunter { .. }
@@ -4259,25 +4280,29 @@ fn print_sandbox_status_snapshot(
         CliOutputFormat::Text => println!("{}", format_sandbox_report(&status)),
         CliOutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "sandbox",
-                "enabled": status.enabled,
-                "active": status.active,
-                "supported": status.supported,
-                "in_container": status.in_container,
-                "requested_namespace": status.requested.namespace_restrictions,
-                "active_namespace": status.namespace_active,
-                "requested_network": status.requested.network_isolation,
-                "active_network": status.network_active,
-                "filesystem_mode": status.filesystem_mode.as_str(),
-                "filesystem_active": status.filesystem_active,
-                "allowed_mounts": status.allowed_mounts,
-                "markers": status.container_markers,
-                "fallback_reason": status.fallback_reason,
-            }))?
+            serde_json::to_string_pretty(&sandbox_json_value(&status))?
         ),
     }
     Ok(())
+}
+
+fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
+    json!({
+        "kind": "sandbox",
+        "enabled": status.enabled,
+        "active": status.active,
+        "supported": status.supported,
+        "in_container": status.in_container,
+        "requested_namespace": status.requested.namespace_restrictions,
+        "active_namespace": status.namespace_active,
+        "requested_network": status.requested.network_isolation,
+        "active_network": status.network_active,
+        "filesystem_mode": status.filesystem_mode.as_str(),
+        "filesystem_active": status.filesystem_active,
+        "allowed_mounts": status.allowed_mounts,
+        "markers": status.container_markers,
+        "fallback_reason": status.fallback_reason,
+    })
 }
 
 fn render_help_topic(topic: LocalHelpTopic) -> String {
@@ -4436,13 +4461,17 @@ fn run_init(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Er
         CliOutputFormat::Text => println!("{message}"),
         CliOutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "init",
-                "message": message,
-            }))?
+            serde_json::to_string_pretty(&init_json_value(&message))?
         ),
     }
     Ok(())
+}
+
+fn init_json_value(message: &str) -> serde_json::Value {
+    json!({
+        "kind": "init",
+        "message": message,
+    })
 }
 
 fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
