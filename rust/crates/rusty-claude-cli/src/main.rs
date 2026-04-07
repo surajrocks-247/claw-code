@@ -7696,12 +7696,13 @@ mod tests {
         print_help_to, push_output_block, render_config_report, render_diff_report,
         render_diff_report_for, render_memory_report, render_repl_help, render_resume_usage,
         resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
-        resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command,
-        slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        resolve_session_reference, response_to_events, resume_supported_slash_commands,
+        run_resume_command, slash_command_completion_candidates_with_sessions, status_context,
+        validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
+        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        LocalHelpTopic, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        PromptHistoryEntry, render_prompt_history_report, parse_history_count,
+        parse_export_args, render_session_markdown, summarize_tool_payload_for_markdown, short_tool_id,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
