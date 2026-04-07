@@ -5657,6 +5657,87 @@ mod tests {
     }
 
     #[test]
+    fn worker_get_returns_worker_state() {
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/tmp/worker-get-test", "trusted_roots": ["/tmp"]}),
+        )
+        .expect("WorkerCreate should succeed");
+        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = created_output["worker_id"].as_str().expect("worker_id");
+
+        let fetched = execute_tool(
+            "WorkerGet",
+            &json!({"worker_id": worker_id}),
+        )
+        .expect("WorkerGet should succeed");
+        let fetched_output: serde_json::Value = serde_json::from_str(&fetched).expect("json");
+        assert_eq!(fetched_output["worker_id"], worker_id);
+        assert_eq!(fetched_output["status"], "spawning");
+        assert_eq!(fetched_output["cwd"], "/tmp/worker-get-test");
+    }
+
+    #[test]
+    fn worker_get_on_unknown_id_returns_error() {
+        let result = execute_tool(
+            "WorkerGet",
+            &json!({"worker_id": "worker_nonexistent_get_00000000"}),
+        );
+        assert!(
+            result.is_err(),
+            "WorkerGet on unknown id should return error"
+        );
+        assert!(
+            result.unwrap_err().contains("worker not found"),
+            "error should mention worker not found"
+        );
+    }
+
+    #[test]
+    fn worker_await_ready_on_spawning_worker_returns_not_ready() {
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/tmp/worker-await-not-ready"}),
+        )
+        .expect("WorkerCreate should succeed");
+        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = created_output["worker_id"].as_str().expect("worker_id");
+
+        // Worker is still in spawning — await_ready should return not-ready snapshot
+        let snapshot = execute_tool(
+            "WorkerAwaitReady",
+            &json!({"worker_id": worker_id}),
+        )
+        .expect("WorkerAwaitReady should succeed even when not ready");
+        let snap_output: serde_json::Value = serde_json::from_str(&snapshot).expect("json");
+        assert_eq!(
+            snap_output["ready"], false,
+            "WorkerAwaitReady on a spawning worker must return ready=false"
+        );
+        assert_eq!(snap_output["worker_id"], worker_id);
+    }
+
+    #[test]
+    fn worker_send_prompt_on_non_ready_worker_returns_error() {
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/tmp/worker-send-not-ready"}),
+        )
+        .expect("WorkerCreate should succeed");
+        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = created_output["worker_id"].as_str().expect("worker_id");
+
+        let result = execute_tool(
+            "WorkerSendPrompt",
+            &json!({"worker_id": worker_id, "prompt": "too early"}),
+        );
+        assert!(
+            result.is_err(),
+            "WorkerSendPrompt on a non-ready worker should fail"
+        );
+    }
+
+    #[test]
     fn recovery_loop_state_file_reflects_transitions() {
         // End-to-end proof: .claw/worker-state.json reflects every transition
         // through the stall-detect -> resolve-trust -> ready loop.
