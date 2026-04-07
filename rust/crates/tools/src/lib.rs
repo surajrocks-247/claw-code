@@ -5619,6 +5619,101 @@ mod tests {
     }
 
     #[test]
+    fn stall_detect_and_resolve_trust_end_to_end() {
+        // 1. Create worker WITHOUT trusted_roots so trust won't auto-resolve
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/no/trusted/root/here"}),
+        )
+        .expect("WorkerCreate should succeed");
+        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = created_output["worker_id"].as_str().expect("worker_id").to_string();
+        assert_eq!(created_output["trust_auto_resolve"], false);
+
+        // 2. Observe trust prompt screen text -> worker stalls at trust_required
+        let stalled = execute_tool(
+            "WorkerObserve",
+            &json!({
+                "worker_id": worker_id,
+                "screen_text": "Do you trust the files in this folder?\n[Allow] [Deny]"
+            }),
+        )
+        .expect("WorkerObserve should succeed");
+        let stalled_output: serde_json::Value = serde_json::from_str(&stalled).expect("json");
+        assert_eq!(
+            stalled_output["status"], "trust_required",
+            "worker should stall at trust_required when trust prompt seen without allowlist"
+        );
+        assert_eq!(stalled_output["trust_gate_cleared"], false);
+        // 3. Clawhip calls WorkerResolveTrust to unblock
+        let resolved = execute_tool(
+            "WorkerResolveTrust",
+            &json!({"worker_id": worker_id}),
+        )
+        .expect("WorkerResolveTrust should succeed");
+        let resolved_output: serde_json::Value = serde_json::from_str(&resolved).expect("json");
+        assert_eq!(
+            resolved_output["status"], "spawning",
+            "worker should return to spawning after trust resolved"
+        );
+        assert_eq!(resolved_output["trust_gate_cleared"], true);
+
+        // 4. Ready screen text now advances worker normally
+        let ready = execute_tool(
+            "WorkerObserve",
+            &json!({
+                "worker_id": worker_id,
+                "screen_text": "Ready for input\n>"
+            }),
+        )
+        .expect("WorkerObserve should succeed after trust resolved");
+        let ready_output: serde_json::Value = serde_json::from_str(&ready).expect("json");
+        assert_eq!(
+            ready_output["status"], "ready_for_prompt",
+            "worker should reach ready_for_prompt after trust resolved and ready screen seen"
+        );
+    }
+
+    #[test]
+    fn stall_detect_and_restart_recovery_end_to_end() {
+        // Worker stalls at trust_required, clawhip restarts instead of resolving
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/no/trusted/root/restart-test"}),
+        )
+        .expect("WorkerCreate should succeed");
+        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = created_output["worker_id"].as_str().expect("worker_id").to_string();
+
+        // Force trust_required
+        let stalled = execute_tool(
+            "WorkerObserve",
+            &json!({
+                "worker_id": worker_id,
+                "screen_text": "trust this folder? [Yes] [No]"
+            }),
+        )
+        .expect("WorkerObserve should succeed");
+        let stalled_output: serde_json::Value = serde_json::from_str(&stalled).expect("json");
+        assert_eq!(stalled_output["status"], "trust_required");
+
+        // WorkerRestart resets the worker
+        let restarted = execute_tool(
+            "WorkerRestart",
+            &json!({"worker_id": worker_id}),
+        )
+        .expect("WorkerRestart should succeed");
+        let restarted_output: serde_json::Value = serde_json::from_str(&restarted).expect("json");
+        assert_eq!(
+            restarted_output["status"], "spawning",
+            "restarted worker should be back at spawning"
+        );
+        assert_eq!(restarted_output["trust_gate_cleared"], false,
+            "restart clears trust — next observe loop must re-acquire trust"
+        );
+    }
+
+    #[test]
     fn worker_terminate_on_unknown_id_returns_error() {
         let result = execute_tool(
             "WorkerTerminate",
