@@ -296,12 +296,12 @@ impl AnthropicClient {
 
         self.preflight_message_request(&request).await?;
 
-        let response = self.send_with_retry(&request).await?;
-        let request_id = request_id_from_headers(response.headers());
-        let mut response = response
-            .json::<MessageResponse>()
-            .await
-            .map_err(ApiError::from)?;
+        let http_response = self.send_with_retry(&request).await?;
+        let request_id = request_id_from_headers(http_response.headers());
+        let body = http_response.text().await.map_err(ApiError::from)?;
+        let mut response = serde_json::from_str::<MessageResponse>(&body).map_err(|error| {
+            ApiError::json_deserialize("Anthropic", &request.model, &body, error)
+        })?;
         if response.request_id.is_none() {
             response.request_id = request_id;
         }
@@ -346,7 +346,7 @@ impl AnthropicClient {
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
-            parser: SseParser::new(),
+            parser: SseParser::new().with_context("Anthropic", request.model.clone()),
             pending: VecDeque::new(),
             done: false,
             request: request.clone(),
@@ -371,10 +371,10 @@ impl AnthropicClient {
             .await
             .map_err(ApiError::from)?;
         let response = expect_success(response).await?;
-        response
-            .json::<OAuthTokenSet>()
-            .await
-            .map_err(ApiError::from)
+        let body = response.text().await.map_err(ApiError::from)?;
+        serde_json::from_str::<OAuthTokenSet>(&body).map_err(|error| {
+            ApiError::json_deserialize("Anthropic OAuth (exchange)", "n/a", &body, error)
+        })
     }
 
     pub async fn refresh_oauth_token(
@@ -391,10 +391,10 @@ impl AnthropicClient {
             .await
             .map_err(ApiError::from)?;
         let response = expect_success(response).await?;
-        response
-            .json::<OAuthTokenSet>()
-            .await
-            .map_err(ApiError::from)
+        let body = response.text().await.map_err(ApiError::from)?;
+        serde_json::from_str::<OAuthTokenSet>(&body).map_err(|error| {
+            ApiError::json_deserialize("Anthropic OAuth (refresh)", "n/a", &body, error)
+        })
     }
 
     async fn send_with_retry(
@@ -523,11 +523,16 @@ impl AnthropicClient {
             .await
             .map_err(ApiError::from)?;
 
-        let parsed = expect_success(response)
-            .await?
-            .json::<CountTokensResponse>()
-            .await
-            .map_err(ApiError::from)?;
+        let response = expect_success(response).await?;
+        let body = response.text().await.map_err(ApiError::from)?;
+        let parsed = serde_json::from_str::<CountTokensResponse>(&body).map_err(|error| {
+            ApiError::json_deserialize(
+                "Anthropic count_tokens",
+                &request.model,
+                &body,
+                error,
+            )
+        })?;
         Ok(parsed.input_tokens)
     }
 
