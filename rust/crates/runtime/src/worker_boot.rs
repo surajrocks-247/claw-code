@@ -592,8 +592,12 @@ fn emit_state_file(worker: &Worker) {
         prompt_in_flight: bool,
         last_event: Option<&'a WorkerEvent>,
         updated_at: u64,
+        /// Seconds since last state transition. Clawhip uses this to detect
+        /// stalled workers without computing epoch deltas.
+        seconds_since_update: u64,
     }
 
+    let now = now_secs();
     let snapshot = StateSnapshot {
         worker_id: &worker.worker_id,
         status: worker.status,
@@ -602,6 +606,7 @@ fn emit_state_file(worker: &Worker) {
         prompt_in_flight: worker.prompt_in_flight,
         last_event: worker.events.last(),
         updated_at: worker.updated_at,
+        seconds_since_update: now.saturating_sub(worker.updated_at),
     };
 
     if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
