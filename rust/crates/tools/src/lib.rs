@@ -5657,6 +5657,80 @@ mod tests {
     }
 
     #[test]
+    fn recovery_loop_state_file_reflects_transitions() {
+        // End-to-end proof: .claw/worker-state.json reflects every transition
+        // through the stall-detect -> resolve-trust -> ready loop.
+        use std::fs;
+
+        // Use a real temp CWD so state file can be written
+        let worktree = temp_path("recovery-loop-state");
+        fs::create_dir_all(&worktree).expect("create worktree");
+        let cwd = worktree.to_str().expect("utf-8").to_string();
+        let state_path = worktree.join(".claw").join("worker-state.json");
+
+        // 1. Create worker WITHOUT trusted_roots
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": cwd}),
+        )
+        .expect("WorkerCreate should succeed");
+        let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = created_output["worker_id"].as_str().expect("worker_id").to_string();
+        // State file should exist after create
+        assert!(state_path.exists(), "state file should be written after WorkerCreate");
+        let state: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&state_path).expect("read state")
+        ).expect("parse state");
+        assert_eq!(state["status"], "spawning");
+        assert_eq!(state["is_ready"], false);
+        assert!(state["seconds_since_update"].is_number(), "seconds_since_update must be present");
+
+        // 2. Force trust_required via observe
+        execute_tool(
+            "WorkerObserve",
+            &json!({"worker_id": worker_id, "screen_text": "Do you trust the files in this folder?"}),
+        )
+        .expect("WorkerObserve should succeed");
+        let state: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&state_path).expect("read state")
+        ).expect("parse state");
+        assert_eq!(state["status"], "trust_required",
+            "state file must reflect trust_required stall");
+        assert_eq!(state["is_ready"], false);
+        assert_eq!(state["trust_gate_cleared"], false);
+        assert!(state["seconds_since_update"].is_number());
+
+        // 3. WorkerResolveTrust -> state file reflects recovery
+        execute_tool(
+            "WorkerResolveTrust",
+            &json!({"worker_id": worker_id}),
+        )
+        .expect("WorkerResolveTrust should succeed");
+        let state: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&state_path).expect("read state")
+        ).expect("parse state");
+        assert_eq!(state["status"], "spawning",
+            "state file must show spawning after trust resolved");
+        assert_eq!(state["trust_gate_cleared"], true);
+
+        // 4. Observe ready screen -> state file shows ready_for_prompt
+        execute_tool(
+            "WorkerObserve",
+            &json!({"worker_id": worker_id, "screen_text": "Ready for input\n>"}),
+        )
+        .expect("WorkerObserve ready should succeed");
+        let state: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&state_path).expect("read state")
+        ).expect("parse state");
+        assert_eq!(state["status"], "ready_for_prompt",
+            "state file must show ready_for_prompt after ready screen");
+        assert_eq!(state["is_ready"], true,
+            "is_ready must be true in state file at ready_for_prompt");
+
+        fs::remove_dir_all(&worktree).ok();
+    }
+
+    #[test]
     fn stall_detect_and_resolve_trust_end_to_end() {
         // 1. Create worker WITHOUT trusted_roots so trust won't auto-resolve
         let created = execute_tool(
