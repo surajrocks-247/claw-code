@@ -20,6 +20,7 @@ pub mod lsp_client;
 mod mcp;
 mod mcp_client;
 pub mod mcp_lifecycle_hardened;
+pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
 mod oauth;
@@ -89,6 +90,7 @@ pub use mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase, McpLifecycleState,
     McpLifecycleValidator, McpPhaseResult,
 };
+pub use mcp_server::{McpServer, McpServerSpec, ToolCallHandler, MCP_SERVER_PROTOCOL_VERSION};
 pub use mcp_stdio::{
     spawn_mcp_stdio_process, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
     ManagedMcpTool, McpDiscoveryFailure, McpInitializeClientInfo, McpInitializeParams,
