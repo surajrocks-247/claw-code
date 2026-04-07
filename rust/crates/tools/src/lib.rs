@@ -964,6 +964,21 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
+            name: "WorkerObserveCompletion",
+            description: "Report session completion to the worker, classifying finish_reason into Finished or Failed (provider-degraded). Use after the opencode session completes to advance the worker to its terminal state.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "worker_id": { "type": "string" },
+                    "finish_reason": { "type": "string" },
+                    "tokens_output": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["worker_id", "finish_reason", "tokens_output"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
             name: "TeamCreate",
             description: "Create a team of sub-agents for parallel task execution.",
             input_schema: json!({
@@ -1229,6 +1244,10 @@ fn execute_tool_with_enforcer(
         }
         "WorkerRestart" => from_value::<WorkerIdInput>(input).and_then(run_worker_restart),
         "WorkerTerminate" => from_value::<WorkerIdInput>(input).and_then(run_worker_terminate),
+        "WorkerObserveCompletion" => {
+            from_value::<WorkerObserveCompletionInput>(input)
+                .and_then(run_worker_observe_completion)
+        }
         "TeamCreate" => from_value::<TeamCreateInput>(input).and_then(run_team_create),
         "TeamDelete" => from_value::<TeamDeleteInput>(input).and_then(run_team_delete),
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
@@ -1487,6 +1506,18 @@ fn run_worker_restart(input: WorkerIdInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_worker_terminate(input: WorkerIdInput) -> Result<String, String> {
     let worker = global_worker_registry().terminate(&input.worker_id)?;
+    to_pretty_json(worker)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_worker_observe_completion(
+    input: WorkerObserveCompletionInput,
+) -> Result<String, String> {
+    let worker = global_worker_registry().observe_completion(
+        &input.worker_id,
+        &input.finish_reason,
+        input.tokens_output,
+    )?;
     to_pretty_json(worker)
 }
 
@@ -2222,6 +2253,13 @@ struct WorkerCreateInput {
 #[derive(Debug, Deserialize)]
 struct WorkerIdInput {
     worker_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerObserveCompletionInput {
+    worker_id: String,
+    finish_reason: String,
+    tokens_output: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5736,6 +5774,63 @@ mod tests {
         assert!(
             result.unwrap_err().contains("worker not found"),
             "error should mention worker not found"
+        );
+    }
+
+    #[test]
+    fn worker_observe_completion_success_finish_sets_finished_status() {
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/tmp/observe-completion-test", "trusted_roots": ["/tmp"]}),
+        )
+        .expect("WorkerCreate should succeed");
+        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
+
+        let completed = execute_tool(
+            "WorkerObserveCompletion",
+            &json!({
+                "worker_id": worker_id,
+                "finish_reason": "end_turn",
+                "tokens_output": 512
+            }),
+        )
+        .expect("WorkerObserveCompletion should succeed");
+        let completed_output: serde_json::Value = serde_json::from_str(&completed).expect("json");
+        assert_eq!(completed_output["status"], "finished");
+        assert_eq!(completed_output["prompt_in_flight"], false);
+    }
+
+    #[test]
+    fn worker_observe_completion_degraded_provider_sets_failed_status() {
+        let created = execute_tool(
+            "WorkerCreate",
+            &json!({"cwd": "/tmp/observe-degraded-test", "trusted_roots": ["/tmp"]}),
+        )
+        .expect("WorkerCreate should succeed");
+        let output: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
+
+        // finish=unknown + 0 tokens = degraded provider classification
+        let failed = execute_tool(
+            "WorkerObserveCompletion",
+            &json!({
+                "worker_id": worker_id,
+                "finish_reason": "unknown",
+                "tokens_output": 0
+            }),
+        )
+        .expect("WorkerObserveCompletion should succeed");
+        let failed_output: serde_json::Value = serde_json::from_str(&failed).expect("json");
+        assert_eq!(
+            failed_output["status"], "failed",
+            "finish=unknown + 0 tokens should classify as provider failure"
+        );
+        assert_eq!(failed_output["prompt_in_flight"], false);
+        // last_error should be set with provider failure message
+        assert!(
+            !failed_output["last_error"].is_null(),
+            "last_error should be populated for provider failure"
         );
     }
 
