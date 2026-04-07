@@ -42,12 +42,13 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    clear_oauth_credentials, format_usd, generate_pkce_pair, generate_state,
-    load_oauth_credentials, load_system_prompt, parse_oauth_callback_request_target,
-    pricing_for_model, resolve_sandbox_status, save_oauth_credentials, ApiClient, ApiRequest,
-    AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool,
-    MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
+    check_base_commit, clear_oauth_credentials, format_stale_base_warning, format_usd,
+    generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt,
+    parse_oauth_callback_request_target, pricing_for_model, resolve_expected_base,
+    resolve_sandbox_status, save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent,
+    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
+    ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole,
+    ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
     PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
     RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
@@ -88,6 +89,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--resume",
     "--print",
     "--compact",
+    "--base-commit",
     "-p",
 ];
 
@@ -198,7 +200,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allowed_tools,
             permission_mode,
             compact: _,
+            base_commit,
         } => {
+            run_stale_base_preflight(base_commit.as_deref());
             let stdin_context = read_piped_stdin();
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             LiveCli::new(model, true, allowed_tools, permission_mode)?
@@ -217,7 +221,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             allowed_tools,
             permission_mode,
-        } => run_repl(model, allowed_tools, permission_mode)?,
+            base_commit,
+        } => run_repl(model, allowed_tools, permission_mode, base_commit)?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -277,6 +282,7 @@ enum CliAction {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
         compact: bool,
+        base_commit: Option<String>,
     },
     Login {
         output_format: CliOutputFormat,
@@ -299,6 +305,7 @@ enum CliAction {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        base_commit: Option<String>,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -341,6 +348,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
     let mut compact = false;
+    let mut base_commit: Option<String> = None;
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -395,6 +403,17 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 compact = true;
                 index += 1;
             }
+            "--base-commit" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --base-commit".to_string())?;
+                base_commit = Some(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--base-commit=") => {
+                base_commit = Some(flag[14..].to_string());
+                index += 1;
+            }
             "-p" => {
                 // Claw Code compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
@@ -409,6 +428,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     permission_mode: permission_mode_override
                         .unwrap_or_else(default_permission_mode),
                     compact,
+                    base_commit: base_commit.clone(),
                 });
             }
             "--print" => {
@@ -466,6 +486,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             model,
             allowed_tools,
             permission_mode,
+            base_commit,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -503,6 +524,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     allowed_tools,
                     permission_mode,
                     compact,
+                    base_commit,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -527,6 +549,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 allowed_tools,
                 permission_mode,
                 compact,
+                base_commit: base_commit.clone(),
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -536,6 +559,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allowed_tools,
             permission_mode,
             compact,
+            base_commit,
         ),
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
@@ -544,6 +568,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allowed_tools,
             permission_mode,
             compact,
+            base_commit,
         }),
     }
 }
@@ -635,6 +660,7 @@ fn parse_direct_slash_cli_action(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     compact: bool,
+    base_commit: Option<String>,
 ) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
@@ -661,6 +687,7 @@ fn parse_direct_slash_cli_action(
                     allowed_tools,
                     permission_mode,
                     compact,
+                    base_commit,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -2665,11 +2692,28 @@ fn run_resume_command(
     }
 }
 
+/// Stale-base preflight: verify the worktree HEAD matches the expected base
+/// commit (from `--base-commit` flag or `.claw-base` file). Emits a warning to
+/// stderr when the HEAD has diverged.
+fn run_stale_base_preflight(flag_value: Option<&str>) {
+    let cwd = match env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return,
+    };
+    let source = resolve_expected_base(flag_value, &cwd);
+    let state = check_base_commit(&cwd, source.as_ref());
+    if let Some(warning) = format_stale_base_warning(&state) {
+        eprintln!("{warning}");
+    }
+}
+
 fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    base_commit: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     let mut editor =
@@ -7980,6 +8024,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                base_commit: None,
             }
         );
     }
@@ -8142,6 +8187,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
+                base_commit: None,
             }
         );
     }
