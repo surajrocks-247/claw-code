@@ -1197,7 +1197,10 @@ mod tests {
         });
         normalize_object_schema(&mut schema2);
         assert_eq!(schema2["additionalProperties"], json!(false));
-        assert_eq!(schema2["properties"]["location"]["additionalProperties"], json!(false));
+        assert_eq!(
+            schema2["properties"]["location"]["additionalProperties"],
+            json!(false)
+        );
 
         // Existing properties/additionalProperties should not be overwritten
         let mut schema3 = json!({
@@ -1206,7 +1209,11 @@ mod tests {
             "additionalProperties": true
         });
         normalize_object_schema(&mut schema3);
-        assert_eq!(schema3["additionalProperties"], json!(true), "must not overwrite existing");
+        assert_eq!(
+            schema3["additionalProperties"],
+            json!(true),
+            "must not overwrite existing"
+        );
     }
 
     #[test]
