@@ -67,6 +67,35 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 > [!NOTE]
 > **Windows (PowerShell):** the binary is `claw.exe`, not `claw`. Use `.\target\debug\claw.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
 
+### Windows setup (Git Bash / WSL)
+
+If you are on Windows, the recommended shell is **Git Bash** (ships with Git for Windows) or **WSL**. Full sequence:
+
+1. **Install Rust** — download from <https://rustup.rs/> and run the installer. Close and reopen the terminal when it finishes.
+2. **Open Git Bash** — search for "Git Bash" in the Start menu (not PowerShell, not cmd). The prompt shows `MINGW64` — this is normal and expected, not a broken install.
+3. **Verify Rust is on PATH:**
+   ```bash
+   cargo --version
+   ```
+   If you see `bash: cargo: command not found`, run `. ~/.cargo/env` or restart Git Bash, then retry.
+4. **Use bash-style paths** — in Git Bash, `C:\Users\you` becomes `/c/Users/you`:
+   ```bash
+   cd /c/Users/you/projects
+   ```
+5. **Clone and build:**
+   ```bash
+   git clone https://github.com/ultraworkers/claw-code
+   cd claw-code/rust
+   cargo build --workspace
+   ```
+6. **Run:**
+   ```bash
+   export ANTHROPIC_API_KEY="sk-ant-..."
+   ./target/debug/claw prompt "say hello"
+   ```
+
+> **WSL tip:** WSL2 (`wsl --install` from an admin PowerShell) is the most friction-free Windows path — follow the Linux quick-start steps inside the WSL terminal.
+
 > [!NOTE]
 > **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
 
