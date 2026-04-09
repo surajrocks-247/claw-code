@@ -2217,11 +2217,33 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
         let command = match SlashCommand::parse(raw_command) {
             Ok(Some(command)) => command,
             Ok(None) => {
-                eprintln!("unsupported resumed command: {raw_command}");
+                if output_format == CliOutputFormat::Json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "error": format!("unsupported resumed command: {raw_command}"),
+                            "command": raw_command,
+                        })
+                    );
+                } else {
+                    eprintln!("unsupported resumed command: {raw_command}");
+                }
                 std::process::exit(2);
             }
             Err(error) => {
-                eprintln!("{error}");
+                if output_format == CliOutputFormat::Json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "error": error.to_string(),
+                            "command": raw_command,
+                        })
+                    );
+                } else {
+                    eprintln!("{error}");
+                }
                 std::process::exit(2);
             }
         };
@@ -2247,7 +2269,18 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 }
             }
             Err(error) => {
-                eprintln!("{error}");
+                if output_format == CliOutputFormat::Json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "error",
+                            "error": error.to_string(),
+                            "command": raw_command,
+                        })
+                    );
+                } else {
+                    eprintln!("{error}");
+                }
                 std::process::exit(2);
             }
         }
