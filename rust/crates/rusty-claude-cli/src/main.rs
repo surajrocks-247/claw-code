@@ -3995,7 +3995,8 @@ impl LiveCli {
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }
             | SlashCommand::AddDir { .. } => {
-                eprintln!("Command registered but not yet implemented.");
+                let cmd_name = command.slash_name();
+                eprintln!("{cmd_name} is not yet implemented in this build.");
                 false
             }
             SlashCommand::Unknown(name) => {
