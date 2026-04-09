@@ -56,6 +56,9 @@ cargo build --workspace
 ./target/debug/claw prompt "summarize this repository"
 ```
 
+> [!NOTE]
+> **Windows (PowerShell):** the binary is `claw.exe`, not `claw`. Use `.\target\debug\claw.exe` or just run `cargo run -- --help` to skip the path lookup.
+
 Authenticate with either an API key or the built-in OAuth flow:
 
 ```bash
