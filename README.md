@@ -72,34 +72,29 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 > [!NOTE]
 > **Windows (PowerShell):** the binary is `claw.exe`, not `claw`. Use `.\target\debug\claw.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
 
-### Windows setup (Git Bash / WSL)
+### Windows setup
 
-If you are on Windows, the recommended shell is **Git Bash** (ships with Git for Windows) or **WSL**. Full sequence:
+**PowerShell is a supported Windows path.** Use whichever shell works for you. The common onboarding issues on Windows are:
 
-1. **Install Rust** — download from <https://rustup.rs/> and run the installer. Close and reopen the terminal when it finishes.
-2. **Open Git Bash** — search for "Git Bash" in the Start menu (not PowerShell, not cmd). The prompt shows `MINGW64` — this is normal and expected, not a broken install.
-3. **Verify Rust is on PATH:**
-   ```bash
+1. **Install Rust first** — download from <https://rustup.rs/> and run the installer. Close and reopen your terminal when it finishes.
+2. **Verify Rust is on PATH:**
+   ```powershell
    cargo --version
    ```
-   If you see `bash: cargo: command not found`, run `. ~/.cargo/env` or restart Git Bash, then retry.
-4. **Use bash-style paths** — in Git Bash, `C:\Users\you` becomes `/c/Users/you`:
-   ```bash
-   cd /c/Users/you/projects
-   ```
-5. **Clone and build:**
-   ```bash
+   If this fails, reopen your terminal or run the PATH setup from the Rust installer output, then retry.
+3. **Clone and build** (works in PowerShell, Git Bash, or WSL):
+   ```powershell
    git clone https://github.com/ultraworkers/claw-code
    cd claw-code/rust
    cargo build --workspace
    ```
-6. **Run:**
-   ```bash
-   export ANTHROPIC_API_KEY="sk-ant-..."
-   ./target/debug/claw prompt "say hello"
+4. **Run** (PowerShell — note `.exe` and backslash):
+   ```powershell
+   $env:ANTHROPIC_API_KEY = "sk-ant-..."
+   .\target\debug\claw.exe prompt "say hello"
    ```
 
-> **WSL tip:** WSL2 (`wsl --install` from an admin PowerShell) is the most friction-free Windows path — follow the Linux quick-start steps inside the WSL terminal.
+**Git Bash / WSL** are optional alternatives, not requirements. If you prefer bash-style paths (`/c/Users/you/...` instead of `C:\Users\you\...`), Git Bash (ships with Git for Windows) works well. In Git Bash, the `MINGW64` prompt is expected and normal — not a broken install.
 
 > [!NOTE]
 > **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
