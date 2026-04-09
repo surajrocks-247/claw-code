@@ -476,11 +476,22 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --reasoning-effort".to_string())?;
+                if !matches!(value.as_str(), "low" | "medium" | "high") {
+                    return Err(format!(
+                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, or high"
+                    ));
+                }
                 reasoning_effort = Some(value.clone());
                 index += 2;
             }
             flag if flag.starts_with("--reasoning-effort=") => {
-                reasoning_effort = Some(flag[19..].to_string());
+                let value = &flag[19..];
+                if !matches!(value, "low" | "medium" | "high") {
+                    return Err(format!(
+                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, or high"
+                    ));
+                }
+                reasoning_effort = Some(value.to_string());
                 index += 1;
             }
             "-p" => {
