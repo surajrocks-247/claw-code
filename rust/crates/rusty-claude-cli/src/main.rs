@@ -7347,7 +7347,6 @@ const STUB_COMMANDS: &[&str] = &[
     "logout",
     "vim",
     "upgrade",
-    "stats",
     "share",
     "feedback",
     "files",
@@ -7385,6 +7384,7 @@ const STUB_COMMANDS: &[&str] = &[
     // Spec entries with no parse arm — produce circular "Did you mean" error
     // without this guard. Adding here routes them to the proper unsupported
     // message and excludes them from REPL completions / help.
+    // NOTE: do NOT add "stats", "tokens", "cache" — they are implemented.
     "allowed-tools",
     "bookmarks",
     "workspace",
