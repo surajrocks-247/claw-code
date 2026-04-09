@@ -46,7 +46,12 @@ The canonical implementation lives in [`rust/`](./rust), and the current source 
 ## Quick start
 
 > [!NOTE]
-> **`cargo install clawcode` will not work** — this package is not published on crates.io. Build from source as shown below.
+> [!WARNING]
+> **`cargo install claw-code` installs the wrong thing.** The `claw-code` crate on crates.io is a deprecated stub that places `claw-code-deprecated.exe` — not `claw`. Running it only prints `"claw-code has been renamed to agent-code"`. **Do not use `cargo install claw-code`.** Either build from source (this repo) or install the upstream binary:
+> ```bash
+> cargo install agent-code   # upstream binary — binary name is 'agent-code', not 'claw'
+> ```
+> This repo (`ultraworkers/claw-code`) is **build-from-source only** — follow the steps below.
 
 ```bash
 # 1. Clone and build
