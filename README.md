@@ -45,8 +45,12 @@ The canonical implementation lives in [`rust/`](./rust), and the current source 
 
 ## Quick start
 
+> [!NOTE]
+> **`cargo install clawcode` will not work** — this package is not published on crates.io. Build from source as shown below.
+
 ```bash
-cd rust
+git clone https://github.com/ultraworkers/claw-code
+cd claw-code/rust
 cargo build --workspace
 ./target/debug/claw --help
 ./target/debug/claw prompt "summarize this repository"
