@@ -226,6 +226,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
         } => {
+            warn_if_broad_cwd();
             run_stale_base_preflight(base_commit.as_deref());
             // Only consume piped stdin as prompt context when the permission
             // mode is fully unattended. In modes where the permission
@@ -2887,6 +2888,25 @@ fn run_resume_command(
 /// Stale-base preflight: verify the worktree HEAD matches the expected base
 /// commit (from `--base-commit` flag or `.claw-base` file). Emits a warning to
 /// stderr when the HEAD has diverged.
+/// Warn when the working directory is very broad (home directory or filesystem
+/// root). claw scopes its file-system access to the working directory, so
+/// starting from a home folder can expose/scan far more than intended.
+fn warn_if_broad_cwd() {
+    let Ok(cwd) = env::current_dir() else { return };
+    let is_home = env::var_os("HOME")
+        .map(|h| PathBuf::from(h) == cwd)
+        .unwrap_or(false);
+    let is_root = cwd.parent().is_none();
+    if is_home || is_root {
+        eprintln!(
+            "Warning: claw is running from a very broad directory ({}).\n\
+             The agent can read and search everything under this path.\n\
+             Consider running from inside your project: cd /path/to/project && claw",
+            cwd.display()
+        );
+    }
+}
+
 fn run_stale_base_preflight(flag_value: Option<&str>) {
     let cwd = match env::current_dir() {
         Ok(cwd) => cwd,
@@ -2906,6 +2926,7 @@ fn run_repl(
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    warn_if_broad_cwd();
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
