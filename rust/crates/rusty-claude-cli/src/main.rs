@@ -1901,14 +1901,34 @@ fn looks_like_slash_command_token(token: &str) -> bool {
 
 fn dump_manifests(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    dump_manifests_at_path(&workspace_dir, output_format)
+}
+
+// Internal function for testing that accepts a workspace directory path.
+fn dump_manifests_at_path(
+    workspace_dir: &std::path::Path,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Surface the resolved path in the error so users can diagnose missing
     // manifest files without guessing what path the binary expected.
     // ROADMAP #45: this path is only correct when running from the build tree;
     // a proper fix would ship manifests alongside the binary.
     let resolved = workspace_dir
         .canonicalize()
-        .unwrap_or_else(|_| workspace_dir.clone());
-    let paths = UpstreamPaths::from_workspace_dir(&workspace_dir);
+        .unwrap_or_else(|_| workspace_dir.to_path_buf());
+
+    let paths = UpstreamPaths::from_workspace_dir(&resolved);
+
+    // Pre-check: verify manifest directory exists
+    let manifest_dir = paths.repo_root();
+    if !manifest_dir.exists() {
+        return Err(format!(
+            "Manifest files (commands.ts, tools.ts) define CLI commands and tools.\n  Expected at: {}\n  Run `claw init` to create them or specify --manifests-dir.",
+            manifest_dir.display()
+        )
+        .into());
+    }
+
     match extract_manifest(&paths) {
         Ok(manifest) => {
             match output_format {
@@ -1930,8 +1950,8 @@ fn dump_manifests(output_format: CliOutputFormat) -> Result<(), Box<dyn std::err
             Ok(())
         }
         Err(error) => Err(format!(
-            "failed to extract manifests: {error}\n  looked in: {}",
-            resolved.display()
+            "failed to extract manifests: {error}\n  looked in: {path}",
+            path = paths.repo_root().display()
         )
         .into()),
     }
@@ -11479,5 +11499,48 @@ mod sandbox_report_tests {
         monitor.stop();
 
         assert!(abort_signal.is_aborted());
+    }
+}
+
+#[cfg(test)]
+mod dump_manifests_tests {
+    use super::{dump_manifests_at_path, CliOutputFormat};
+
+    #[test]
+    fn dump_manifests_shows_helpful_error_when_manifests_missing() {
+        // Create a temp directory without manifest files
+        let temp_dir = std::env::temp_dir().join(format!(
+            "claw_test_missing_manifests_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+        // Clean up at the end of the test
+        let _cleanup = std::panic::catch_unwind(|| {
+            // Call dump_manifests_at_path with the temp directory
+            let result = dump_manifests_at_path(&temp_dir, CliOutputFormat::Text);
+
+            // Assert that the call fails
+            assert!(result.is_err(), "expected an error when manifests are missing");
+
+            let error_msg = result.unwrap_err().to_string();
+
+            // Assert the error message contains "Manifest files (commands.ts, tools.ts)"
+            assert!(
+                error_msg.contains("Manifest files (commands.ts, tools.ts)"),
+                "error message should mention manifest files: {}",
+                error_msg
+            );
+
+            // Assert the error message contains the expected path
+            assert!(
+                error_msg.contains(&temp_dir.display().to_string()),
+                "error message should contain the expected path: {}",
+                error_msg
+            );
+        });
+
+        // Clean up temp directory
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
