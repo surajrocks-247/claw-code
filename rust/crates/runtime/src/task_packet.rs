@@ -123,7 +123,12 @@ fn validate_scope_requirements(packet: &TaskPacket, errors: &mut Vec<String>) {
         TaskScope::Module | TaskScope::SingleFile | TaskScope::Custom
     );
 
-    if needs_scope_path && packet.scope_path.as_ref().is_none_or(|p| p.trim().is_empty()) {
+    if needs_scope_path
+        && packet
+            .scope_path
+            .as_ref()
+            .is_none_or(|p| p.trim().is_empty())
+    {
         errors.push(format!(
             "scope_path is required for scope '{}'",
             packet.scope
