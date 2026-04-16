@@ -99,6 +99,23 @@
       ],
       "passes": true,
       "priority": "P2"
+    },
+    {
+      "id": "US-008",
+      "title": "Fix kimi-k2.5 model API compatibility",
+      "description": "The kimi-k2.5 model (and other kimi models) reject API requests containing the is_error field in tool result messages. The OpenAI-compatible provider currently always includes is_error for all models. Need to make this field conditional based on model support.",
+      "acceptanceCriteria": [
+        "translate_message function accepts model parameter",
+        "is_error field excluded for kimi models (kimi-k2.5, kimi-k1.5, etc.)",
+        "is_error field included for models that support it (openai, grok, xai, etc.)",
+        "build_chat_completion_request passes model to translate_message",
+        "Tests verify is_error presence/absence based on model",
+        "cargo test passes",
+        "cargo clippy passes",
+        "cargo fmt passes"
+      ],
+      "passes": true,
+      "priority": "P0"
     }
   ]
 }
