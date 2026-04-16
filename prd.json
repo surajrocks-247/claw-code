@@ -158,7 +158,7 @@
         "Benchmark before/after showing improvement",
         "No functional changes or API breakage"
       ],
-      "passes": false,
+      "passes": true,
       "priority": "P2"
     }
   ]

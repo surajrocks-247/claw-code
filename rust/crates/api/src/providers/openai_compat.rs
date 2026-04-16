@@ -752,7 +752,12 @@ struct ErrorBody {
 /// Returns true for models known to reject tuning parameters like temperature,
 /// `top_p`, `frequency_penalty`, and `presence_penalty`. These are typically
 /// reasoning/chain-of-thought models with fixed sampling.
-fn is_reasoning_model(model: &str) -> bool {
+/// Returns true for models known to reject tuning parameters like temperature,
+/// `top_p`, `frequency_penalty`, and `presence_penalty`. These are typically
+/// reasoning/chain-of-thought models with fixed sampling.
+/// Public for benchmarking and testing purposes.
+#[must_use]
+pub fn is_reasoning_model(model: &str) -> bool {
     let lowered = model.to_ascii_lowercase();
     // Strip any provider/ prefix for the check (e.g. qwen/qwen-qwq -> qwen-qwq)
     let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
@@ -786,7 +791,9 @@ fn strip_routing_prefix(model: &str) -> &str {
     }
 }
 
-fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
+/// Builds a chat completion request payload from a `MessageRequest`.
+/// Public for benchmarking purposes.
+pub fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
         messages.push(json!({
@@ -869,7 +876,11 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
 
 /// Returns true for models that do NOT support the `is_error` field in tool results.
 /// kimi models (via Moonshot AI/Dashscope) reject this field with 400 Bad Request.
-fn model_rejects_is_error_field(model: &str) -> bool {
+/// Returns true for models that do NOT support the `is_error` field in tool results.
+/// kimi models (via Moonshot AI/Dashscope) reject this field with 400 Bad Request.
+/// Public for benchmarking and testing purposes.
+#[must_use]
+pub fn model_rejects_is_error_field(model: &str) -> bool {
     let lowered = model.to_ascii_lowercase();
     // Strip any provider/ prefix for the check
     let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
@@ -877,7 +888,10 @@ fn model_rejects_is_error_field(model: &str) -> bool {
     canonical.starts_with("kimi")
 }
 
-fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
+/// Translates an `InputMessage` into OpenAI-compatible message format.
+/// Public for benchmarking purposes.
+#[must_use]
+pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
     let supports_is_error = !model_rejects_is_error_field(model);
     match message.role.as_str() {
         "assistant" => {
@@ -955,7 +969,10 @@ fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
 /// `tool_calls` array containing an entry whose `id` matches the tool
 /// message's `tool_call_id`, the pair is valid and both are kept. Otherwise
 /// the tool message is dropped.
-fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
+/// Remove `role:"tool"` messages from `messages` that have no valid paired
+/// `role:"assistant"` message with a matching `tool_calls[].id` immediately
+/// preceding them. Public for benchmarking purposes.
+pub fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
     // Collect indices of tool messages that are orphaned.
     let mut drop_indices = std::collections::HashSet::new();
     for (i, msg) in messages.iter().enumerate() {
@@ -1011,15 +1028,36 @@ fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
-fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
-    content
+/// Flattens tool result content blocks into a single string.
+/// Optimized to pre-allocate capacity and avoid intermediate `Vec` construction.
+#[must_use]
+pub fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
+    // Pre-calculate total capacity needed to avoid reallocations
+    let total_len: usize = content
         .iter()
         .map(|block| match block {
-            ToolResultContentBlock::Text { text } => text.clone(),
-            ToolResultContentBlock::Json { value } => value.to_string(),
+            ToolResultContentBlock::Text { text } => text.len(),
+            ToolResultContentBlock::Json { value } => value.to_string().len(),
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .sum();
+
+    // Add capacity for newlines between blocks
+    let capacity = total_len + content.len().saturating_sub(1);
+
+    let mut result = String::with_capacity(capacity);
+    for (i, block) in content.iter().enumerate() {
+        if i > 0 {
+            result.push('\n');
+        }
+        match block {
+            ToolResultContentBlock::Text { text } => result.push_str(text),
+            ToolResultContentBlock::Json { value } => {
+                // Use write! to append without creating intermediate String
+                result.push_str(&value.to_string());
+            }
+        }
+    }
+    result
 }
 
 /// Recursively ensure every object-type node in a JSON Schema has
