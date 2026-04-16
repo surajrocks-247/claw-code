@@ -144,7 +144,7 @@
         "Document qwen model routing through dashscope",
         "Cross-reference with existing code comments"
       ],
-      "passes": false,
+      "passes": true,
       "priority": "P2"
     },
     {
