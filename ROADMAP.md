@@ -1826,3 +1826,71 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
    **Blocker.** None. Substitution is ~30–50 lines of string handling + a regression-test sweep across the five config fields. Doctor check is another ~15 lines mirroring `check_sandbox_health` shape.
 
    **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdE` on main HEAD `d0de86e` in response to Clawhip pinpoint nudge at `1494721628917989417`. Third member of the reporting-surface sub-cluster (`#90` leaking unredacted secrets, `#91` misaligned permission-mode aliases, `#92` literal-interpolation silence). Adjacent to ROADMAP principle #6 ("Plugin/MCP failures are under-classified"): this is a specific instance where a config-time failure is deferred to spawn-time and arrives at the operator stripped of the context that would let them diagnose it. Distinct from the truth-audit cluster (#80–#87, #89): the config *accurately* stores what was written; the bug is that no runtime code resolves the standard ecosystem-idiomatic sigils those strings contain.
+
+93. **`--resume <reference>` semantics silently fork on a brittle "looks-like-a-path" heuristic — `session-X` goes to the managed store but `session-X.jsonl` opens a workspace-relative file, and any absolute path is opened verbatim with no workspace scoping** — dogfooded 2026-04-18 on main HEAD `bab66bb` from `/tmp/cdH`. The flag accepts the same-looking string in two very different code paths depending on whether `PathBuf::extension()` returns `Some` or `path.components().count() > 1`.
+
+   **Concrete repros.**
+
+   *Same-looking reference, different code paths.*
+   ```sh
+   # (a) No extension, no slash -> looks up managed session
+   claw --resume session-123
+   # {"error":"failed to restore session: session not found: session-123\nHint: managed sessions live in .claw/sessions/."}
+
+   # (b) Add .jsonl suffix -> now a workspace-relative FILE path
+   touch session-123.jsonl
+   claw --resume session-123.jsonl
+   # {"kind":"restored","path":"/private/tmp/cdH/session-123.jsonl","session_id":"session-...-0"}
+   ```
+   An operator copying `/session list`'s `session-1776441782197-0` into `--resume session-1776441782197-0` works. Adding `.jsonl` (reasonable instinct for "it's a file") silently switches to workspace-relative lookup, which does *not* find the managed file under `.claw/sessions/<fingerprint>/session-1776441782197-0.jsonl` and instead tries `<cwd>/session-1776441782197-0.jsonl`.
+
+   *Absolute paths are opened verbatim with no workspace scoping.*
+   ```sh
+   claw --resume /etc/passwd
+   # {"error":"failed to restore session: invalid JSONL record at line 1: unexpected character: #"}
+   claw --resume /etc/hosts
+   # {"error":"failed to restore session: invalid JSONL record at line 1: unexpected character: #"}
+   ```
+   `claw` *read* those files. It only rejected them because they failed JSONL parsing. The path accepted by `--resume` is unscoped: any readable file on the filesystem is a valid `--resume` target.
+
+   *Symlinks inside `.claw/sessions/<fingerprint>/` follow out of the workspace.*
+   ```sh
+   mkdir -p .claw/sessions/<fingerprint>/
+   ln -sf /etc/passwd .claw/sessions/<fingerprint>/passwd-symlink.jsonl
+   claw --resume passwd-symlink
+   # {"error":"failed to restore session: invalid JSONL record at line 1: unexpected character: #"}
+   ```
+   The managed-path branch honors symlinks without resolving-and-checking that the target stays under the workspace.
+
+   **Trace path.**
+    - `rust/crates/runtime/src/session_control.rs:86-116` — `SessionStore::resolve_reference` branches on a heuristic:
+      ```rust
+      let direct = PathBuf::from(reference);
+      let candidate = if direct.is_absolute() { direct.clone() }
+                      else { self.workspace_root.join(&direct) };
+      let looks_like_path = direct.extension().is_some() || direct.components().count() > 1;
+      let path = if candidate.exists()              { candidate }
+                 else if looks_like_path            { return Err(missing_reference(…)) }
+                 else                               { self.resolve_managed_path(reference)? };
+      ```
+      The heuristic is textual (`.` or `/` in the string), not structural. There is no canonicalize-and-check-prefix step to enforce that the resolved path stays under the workspace session root.
+    - `rust/crates/runtime/src/session_control.rs:118-148` — `resolve_managed_path` joins `sessions_root` with `<id>.jsonl` / `.json`. If the resulting path is a symlink, `fs::read_to_string` follows it silently.
+    - Resume error surface at `rusty-claude-cli/src/main.rs:…` prints the parse error plus the first character / line number of the file that was read. Does not leak content verbatim, but reveals file structural metadata (first byte, line count through the failure point) for any readable file on the filesystem. This is a mild information-disclosure primitive when an orchestrator accepts untrusted `--resume` input.
+
+   **Why this is specifically a clawability gap.**
+    1. *Two user-visible shapes for one intended contract.* The `/session list` REPL command presents session ids as `session-1776441782197-0`. Operators naturally try `--resume session-1776441782197-0` (works) and `--resume session-1776441782197-0.jsonl` (silently breaks). The mental model "it's a file; I'll add the extension" is wrong, and nothing in the error message (`session not found: session-1776441782197-0.jsonl`) explains that the extension silently switched the lookup mode.
+    2. *Batch orchestrator surprise.* Clawhip-style tooling that persists session ids and passes them back through `--resume` cannot depend on round-tripping: a session id that came out of `claw --output-format json status` as `"session-...-0"` under `workspace.session_id` must be passed *without* a `.jsonl` suffix or without any slash-containing directory prefix. Any path-munging that an orchestrator does along the way flips the lookup mode.
+    3. *No workspace scoping.* Even if the heuristic is kept as-is, `candidate.exists()` should canonicalize the path and refuse it if it escapes `self.workspace_root`. As shipped, `--resume /etc/passwd` / `--resume ../other-project/.claw/sessions/<fp>/foreign.jsonl` both proceed to read arbitrary files.
+    4. *Symlink-follow inside managed path.* The managed-path branch (where operators trust that `.claw/sessions/` is internally safe) silently follows symlinks out of the workspace, turning a weak "managed = scoped" assumption into a false one.
+    5. *Principle #6 violation.* "Terminal is transport, not truth" is echoed by "session id is an opaque handle, not a path." Letting the flag accept both shapes interchangeably — with a heuristic that the operator can only learn by experiment — is the exact "semantics leak through accidental inputs" shape principle #6 argues against.
+
+   **Fix shape — three pieces, each small.**
+   1. *Separate the two shapes into explicit sub-arguments.* `--resume <id>` for managed ids (stricter character class; reject `.` and `/`); `--resume-file <path>` for explicit file paths. Deprecate the combined shape behind a single rewrite cycle. Keep the `latest` alias.
+   2. *If keeping the combined shape, canonicalize and scope the path.* After resolving `candidate`, call `candidate.canonicalize()?` and assert the result starts with `self.workspace_root.canonicalize()?` (or an allow-listed set of roots). Reject with a typed error `SessionControlError::OutsideWorkspace { requested, workspace_root }` otherwise. This also covers the symlink-escape inside `.claw/sessions/<fingerprint>/`.
+   3. *Surface the resolved path in `--resume` success.* `status` / `session list` already print the path; `--resume` currently prints `{"kind":"restored","path":…}` on success, but on the *failure* path the resolved vs requested distinction is lost (error shows only the requested string). Return both so an operator can tell whether the file-path branch or the managed-id branch was chosen.
+
+   **Acceptance.** `claw --resume session-123` and `claw --resume session-123.jsonl` either both succeed (by having the file-path branch fall through to the managed-id branch when the direct `candidate.exists()` check fails), or they surface a typed error that explicitly says which branch was chosen and why. `claw --resume /etc/passwd` and `claw --resume ../other-workspace/session.jsonl` fail with `OutsideWorkspace` without attempting to read the file. Symlinks in `.claw/sessions/<fingerprint>/` that target outside the workspace are rejected with the same typed error.
+
+   **Blocker.** None. Canonicalize-and-check-prefix is ~15 lines in `resolve_reference`, plus error-type + test updates. The explicit-shape split is orthogonal and can ship separately.
+
+   **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdH` on main HEAD `bab66bb` in response to Clawhip pinpoint nudge at `1494729188895359097`. Sits between clusters: it's *partially* a discovery-overreach item (like #85/#88, the reference resolution reaches outside the workspace), *partially* a truth-audit item (the two error strings for the two branches don't tell the operator which branch was taken), and *partially* a reporting-surface item (the heuristic is invisible in `claw --help` and in `--output-format json` error payloads). Best filed as the first member of a new "reference-resolution semantics split" sub-cluster; if #80 (error copy lies about the managed-session search path) were reframed today it would be the natural sibling.
