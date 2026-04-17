@@ -1661,3 +1661,72 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
    **Blocker.** None. Marker-file detection is filesystem-only; no new git subprocess calls; no schema change beyond a single additive field. Same reporting-shape family as #82 (sandbox machinery visible) and #87 (permission source field) — all are "add a typed field the surface is currently silent about."
 
    **Source.** Jobdori dogfood 2026-04-17 against `/tmp/git-state-probe` on main HEAD `9882f07` in response to Clawhip pinpoint nudge at `1494698980091756678`. Eighth member of the truth-audit / diagnostic-integrity cluster after #80, #81, #82, #83, #84, #86, #87 — and the one most directly in scope for the "branch freshness before blame" principle the ROADMAP's preflight section is built around. Distinct from the discovery-overreach cluster (#85, #88): here the workspace surface is not reaching into state it shouldn't — it is failing to report state that lives in plain view inside `.git/`.
+
+90. **`claw mcp` JSON/text surface redacts MCP server `env` values but dumps `args`, `url`, and `headersHelper` verbatim — standard secret-carrying fields leak to every consumer of the machine-readable MCP surface** — dogfooded 2026-04-17 on main HEAD `64b29f1` from `/tmp/cdB`. The MCP details surface deliberately redacts `env` to `env_keys` (only key names, not values) and `headers` to `header_keys` — a correct design choice. The same surface then dumps `args`, the `url`, and `headersHelper` unredacted, even though all three routinely carry inline credentials.
+
+   **Three concrete repros, all on one `.claw.json`.**
+
+   *Secrets in args (stdio transport).*
+   ```json
+   {"mcpServers":{"secret-in-args":{"command":"/usr/local/bin/my-server",
+     "args":["--api-key","sk-secret-ABC123",
+             "--token=BEARER-xyz-987",
+             "--url=https://user:password@db.internal:5432/db"]}}}
+   ```
+   `claw --output-format json mcp show secret-in-args` returns:
+   ```json
+   {"details":{"args":["--api-key","sk-secret-ABC123","--token=BEARER-xyz-987",
+                       "--url=https://user:password@db.internal:5432/db"],
+                "env_keys":[],"command":"/usr/local/bin/my-server"},
+    "summary":"/usr/local/bin/my-server --api-key sk-secret-ABC123 --token=BEARER-xyz-987 --url=https://user:password@db.internal:5432/db",...}
+   ```
+   Same secret material appears twice — once in `details.args` and once in the human-readable `summary`.
+
+   *Inline credentials in URL (http/sse/ws transport).*
+   ```json
+   {"mcpServers":{"with-url-creds":{
+     "url":"https://user:SECRET@api.internal.example.com/mcp",
+     "headers":{"Authorization":"Bearer sk-leaked-via-header-name"}}}}
+   ```
+   `claw mcp show with-url-creds` JSON:
+   ```json
+   {"details":{"url":"https://user:SECRET@api.internal.example.com/mcp",
+                "header_keys":["Authorization"],"headers_helper":null,...},
+    "summary":"https://user:SECRET@api.internal.example.com/mcp",...}
+   ```
+   Header **keys** are correctly redacted (`Authorization` key visible, `Bearer sk-...` value hidden). URL basic-auth credentials are dumped verbatim in both `url` and `summary`.
+
+   *Secrets in headersHelper command (http/sse transport).*
+   ```json
+   {"mcpServers":{"with-helper":{
+     "url":"https://api.example.com/mcp",
+     "headersHelper":"/usr/local/bin/auth-helper --api-key sk-in-helper-args --tenant secret-tenant"}}}
+   ```
+   `claw mcp show with-helper` JSON:
+   ```json
+   {"details":{"headers_helper":"/usr/local/bin/auth-helper --api-key sk-in-helper-args --tenant secret-tenant",...}}
+   ```
+   The helper command path + its secret-bearing arguments are emitted whole.
+
+   **Trace path — where the redaction logic lives and where it stops.**
+    - `rust/crates/commands/src/lib.rs:3972-3999` — `mcp_server_details_json` is the single point where redaction decisions are made. For `Stdio`: `env_keys` correctly projects keys; `args` is `&config.args` verbatim. For `Sse` / `Http`: `header_keys` correctly projects keys; `url` is `&config.url` verbatim; `headers_helper` is `&config.headers_helper` verbatim. For `Ws`: same as `Sse`/`Http`.
+    - The intent of the redaction design is visible from the `env_keys` / `header_keys` pattern — "surface what's configured without leaking the secret material." The design is just incomplete. `args`, `url`, and `headers_helper` are carved out of the redaction with no supporting comment explaining why.
+    - Text surface (`claw mcp show`) at `commands/src/lib.rs:3873-3920` (the `render_mcp_server_report` / `render_mcp_show_report` helpers) mirrors the JSON: `Args`, `Url`, `Headers helper` lines all print the raw stored value. Both surfaces leak equally.
+
+   **Why this is specifically a clawability gap.**
+    1. *Machine-readable surface consumed by automation.* `mcp list --output-format json` is the surface clawhip / orchestrators are designed to scrape for preflight and lane setup. Any consumer that logs the JSON (Discord announcement, CI artifact, debug log, session transcript export — see `claw export` — bug tracker attachment) now carries the MCP server's secret material in plain text.
+    2. *Asymmetric redaction sends the wrong signal.* Because `env_keys` and `header_keys` are correctly redacted, a consumer reasonably assumes the surface is "secret-aware" across the board. The `args` / `url` / `headers_helper` leak is therefore *unexpected*, not loudly documented as caveat, and easy to miss during review.
+    3. *Standard patterns are hit.* Every one of the examples above is a **standard** way of wiring MCP servers: `--api-key`, `--token=...`, `postgres://user:pass@host/db`, `--url=https://<token>@host/...`, helper scripts that take credentials as args. The MCP docs and most community server configs look exactly like this. The leak isn't a weird edge case; it's the common case.
+    4. *No `mcp.secret_leak_risk` preflight.* `claw doctor` says nothing about whether an MCP server's args or URL look like they contain high-entropy secret material. Even a primitive `token=` / `api[-_]key` / `password=` / `https?://[^/:]+:[^@]+@` regex sweep would raise a `warn` in exactly these cases.
+
+   **Fix shape — three pieces, all in `mcp_server_details_json` + its text mirror.**
+   1. *Redact args to `args_summary` (shape-preserving) + `args_len` (count).* Replace `args: &config.args` with `args_summary` that records the count, which flags look like they carry secrets (heuristic: `--api-key`, `--token`, `--password`, `--auth`, `--secret`, `=` containing high-entropy tail, inline `user:pass@`), and emits redacted placeholders like `"--api-key=<redacted:32-char-token>"`. A `--show-sensitive` flag on `claw mcp show` can opt back into full args when the operator explicitly wants them.
+   2. *Redact URL basic-auth.* For any URL that contains `user:pass@`, emit the URL with the password segment replaced by `<redacted>` and add `url_has_credentials: true` so consumers can branch on it. Query-string secrets (`?api_key=...`, `?token=...`) get the same redaction heuristic as args.
+   3. *Redact `headersHelper` argv.* Split on whitespace, keep `argv[0]` (the command path), apply the args heuristic from piece 1 to the rest.
+   4. *Optional: add a `mcp_secret_posture` doctor check.* Emit `warn` when any configured MCP server has args/URL/helper matching the secret heuristic and no opt-in has been granted. Actionable: "move the secret to `env`, reference it via `${ENV_VAR}` interpolation, or explicitly `allow_sensitive_in_args` in settings."
+
+   **Acceptance.** `claw --output-format json mcp show <name>` on a server configured with `--api-key sk-...` or `https://user:pass@host` or `headersHelper "/bin/get-token --api-key ..."` no longer echoes the secret material in either the JSON `details` block, the `summary` string, or the text surface. A new `show-sensitive` flag (or `CLAW_MCP_SHOW_SENSITIVE=1` env escape) provides explicit opt-in for diagnostic runs that need the full argv. Existing `env_keys` / `header_keys` semantics are preserved. A `mcp_secret_posture` doctor check flags high-risk configurations.
+
+   **Blocker.** None. Fix is ~40–60 lines across `mcp_server_details_json` + the text-surface mirror + a tiny secret-heuristic helper + three regression tests (api-key arg redaction, URL basic-auth redaction, headersHelper argv redaction). No MCP runtime behavior changes — the config values still flow unchanged into the MCP client; only the *reporting surface* changes.
+
+   **Source.** Jobdori dogfood 2026-04-17 against `/tmp/cdB` on main HEAD `64b29f1` in response to Clawhip pinpoint nudge at `1494706529918517390`. Distinct from both clusters so far. *Not* a truth-audit item (#80–#87, #89): the MCP surface is *accurate* about what's configured; the problem is it's too accurate — it projects secret material it was clearly trying to redact (see the `env_keys` / `header_keys` precedent). *Not* a discovery-overreach item (#85, #88): the surface is scoped to `.claw.json` / `.claw/settings.json`, no ancestor walk involved. First member of a new sub-cluster — "redaction surface is incomplete" — that sits adjacent to both: the output *format* is the bug, not the discovery scope or the diagnostic verdict.
