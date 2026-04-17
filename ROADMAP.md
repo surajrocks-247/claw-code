@@ -1376,3 +1376,34 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
    **Blocker.** None for Option A. Option B depends on agreeing to ship a Seatbelt profile and accepting the "deprecated API" maintenance burden — orthogonal enough that it shouldn't block the honesty fix.
 
    **Source.** Jobdori dogfood 2026-04-17 against `/tmp/claw-dogfood-2` on main HEAD `1743e60` in response to Clawhip pinpoint nudge at `1494646135317598239`. Adjacent family: ROADMAP principle #5 (degraded-mode should be first-class + machine-readable) and #6 (human UX leaks into claw workflows — here, a status field that *looks* boolean-correct but carries platform-specific semantics). Filed under the same reporting-integrity heading as #77 (missing `ErrorKind`) and #80 (error copy lies about search path): the surface says one thing, the runtime does another.
+
+83. **`claw` injects the *build date* into the live agent system prompt as "today's date" — agents run one week (or any N days) behind real time whenever the binary has aged** — dogfooded 2026-04-17 on main HEAD `e58c194` against `/tmp/cd3`. The binary was built on 2026-04-10 (`claw --version` → `Build date 2026-04-10`). Today is 2026-04-17. Running `claw system-prompt` from a fresh workspace yields:
+   ```
+    - Date: 2026-04-10
+    - Today's date is 2026-04-10.
+   ```
+   Passing `--date 2026-04-17` produces the correct output (`Today's date is 2026-04-17.`), which confirms the system-prompt plumbing supports the current date — the default just happens to be wrong.
+
+   **Scope — this is not just the `system-prompt` subcommand.** The same stale `DEFAULT_DATE` constant is threaded into every runtime entry point that builds the live agent prompt: `build_system_prompt()` at `rust/crates/rusty-claude-cli/src/main.rs:6173-6180` hard-codes `DEFAULT_DATE` when constructing the REPL / prompt-mode runtime, and that `system_prompt` Vec is then cloned into every `ClaudeCliSession` / `StreamingCliSession` / non-interactive runner (lines 3649, 3746, 4165, 4211, 4241, 4282, 4438, 4473, 4569, 4589, 4613, etc.). `parse_system_prompt_args` at line 1167 and `render_doctor_report` / `build_status_context` / `render_memory_report` at 1482, 4990, 5372, 5411 also default to `DEFAULT_DATE`. In short: unless the caller is running the `system-prompt` subcommand *and* explicitly passes `--date`, the date baked into the binary at compile time wins.
+
+   **Trace path — how the build date becomes "today."**
+    - `rust/crates/rusty-claude-cli/build.rs:25-52` — `build.rs` writes `cargo:rustc-env=BUILD_DATE=<date>`, defaulting to the current UTC date at compile time (or `SOURCE_DATE_EPOCH`-derived for reproducible builds).
+    - `rust/crates/rusty-claude-cli/src/main.rs:69-72` — `const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") { Some(d) => d, None => "unknown" };`. Compile-time only; never re-evaluated.
+    - `rust/crates/rusty-claude-cli/src/main.rs:6173-6180` — `build_system_prompt()` calls `load_system_prompt(cwd, DEFAULT_DATE, env::consts::OS, "unknown")`.
+    - `rust/crates/runtime/src/prompt.rs:431-445` — `load_system_prompt` forwards that string straight into `ProjectContext::discover_with_git(&cwd, current_date)`.
+    - `rust/crates/runtime/src/prompt.rs:287-292` — `render_project_context` emits `Today's date is {project_context.current_date}.`. No `chrono::Utc::now()`, no filesystem clock, no override — just the string that was handed in.
+   End result: the agent believes the universe is frozen at compile time. Any task the agent does that depends on "today" (scheduling, deadline reasoning, "what's recent," expiry checks, release-date comparisons, vacation logic, "which branch is stale," even "is this dependency abandoned") reasons from a stale fact.
+
+   **Why this is specifically a clawability gap.** Principle #4 ("Branch freshness before blame") and Principle #7 ("Terminal is transport, not truth") both assume *real* time. A claw running verification today on a branch last pushed yesterday should know *today* is today so it can compute "last push was N hours ago." A `claw` binary produced a week ago hands the agent a world where today *is* the push date, making freshness reasoning silently wrong. This is also a latent testing/replay bug: the stale-date default mixes compile-time context into runtime behavior, which breaks reproducibility in exactly the wrong direction — two agents on the same main HEAD, built a week apart, will render different system prompts.
+
+   **Fix shape — one canonical default with explicit override.**
+   1. Compute `current_date` at runtime, not compile time. Add a small helper in `runtime::prompt` (or a new `clock.rs`) that returns today's UTC date as `YYYY-MM-DD`, using `chrono::Utc::now().date_naive()` or equivalent. No new heavy dependency — `chrono` is already transitively in the tree. ~10 lines.
+   2. Replace every `DEFAULT_DATE` use site in `rusty-claude-cli/src/main.rs` (call sites enumerated above) with a call to that helper. Leave `DEFAULT_DATE` intact *only* for the `claw version` / `--version` build-metadata path (its honest meaning).
+   3. Preserve `--date YYYY-MM-DD` override on `system-prompt` as-is; add an env-var escape hatch (`CLAWD_OVERRIDE_DATE=YYYY-MM-DD`) for deterministic tests and SOURCE_DATE_EPOCH-style reproducible agent prompts.
+   4. Regression test: freeze the clock via the env escape, assert `load_system_prompt(cwd, <runtime-default>, ...)` emits the *frozen* date, not the build date. Also a smoke test that the *actual* runtime default rejects any value matching `option_env!("BUILD_DATE")` unless the env override is set.
+
+   **Acceptance.** `claw` binary built on day N, invoked on day N+K: the `Today's date is …` line in the live agent system prompt reads day N+K. `claw --version` still shows build date N. The two fields stop sharing a value by accident.
+
+   **Blocker.** None. Scope is ~30 lines of glue (helper + call-site sweep + one regression test). Breakage risk is low — the only consumers that deliberately read `DEFAULT_DATE` *as* today are the ones being fixed; `claw version` / `--version` keeps its honest compile-time meaning.
+
+   **Source.** Jobdori dogfood 2026-04-17 against `/tmp/cd3` on main HEAD `e58c194` in response to Clawhip pinpoint nudge at `1494653681222811751`. Distinct from #80/#81/#82 (status/error surfaces lie about *static* runtime state): this is a surface that lies about *time itself*, and the lie is smeared into every live-agent system prompt, not just a single error string or status field.
