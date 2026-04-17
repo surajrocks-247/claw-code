@@ -2118,3 +2118,67 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
     **Blocker.** None. Tightening the parser is ~10 lines. Surfacing the active allow-set in status JSON is ~15 lines. Adding the doctor check is ~25 lines. Accepting `allowedTools` in config — or improving its rejection message — is ~10 lines. All tractable in one small PR.
 
     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdL` on main HEAD `3ab920a` in response to Clawhip pinpoint nudge at `1494759381068419115`. Joins the **permission-audit sweep** (#50 / #87 / #91 / #94) on a new axis: those four cover permission *modes* and *rules*; #97 covers the *tool-allow-list* knob with the same class of problem (silent input handling + missing diagnostic visibility). Also sibling of **#86** (corrupt `.claw.json` silently dropped, doctor reports ok) on the truth-audit side: both are "misconfigured claws have no observable signal." Natural 3-way bundle: **#86 + #94 + #97** all add diagnostic coverage to `claw doctor` for configuration hygiene the current surface silently swallows.
+
+98. **`--compact` is silently ignored outside the `Prompt → Text` path: `--compact --output-format json` (explicitly documented as "text mode only" in `--help` but unenforced), `--compact status`, `--compact doctor`, `--compact sandbox`, `--compact init`, `--compact export`, `--compact mcp`, `--compact skills`, `--compact agents`, and `claw --compact` with piped stdin (hardcoded `compact: false` at the stdin fallthrough). No error, no warning, no diagnostic trace anywhere** — dogfooded 2026-04-18 on main HEAD `7a172a2` from `/tmp/cdM`. `--help` at `main.rs:8251` explicitly documents "`--compact` (text mode only; useful for piping)"; the implementation *knows* the flag is only meaningful for the text branch of the prompt turn output, but does not refuse or warn in any other case. A claw piping output through `claw --compact --output-format json prompt "..."` gets the same verbose JSON blob as without the flag, silently, with no indication that its documented behavior was discarded.
+
+    **Concrete repro.**
+    ```
+    $ cd /tmp/cdM && git init -q .
+    $ ~/clawd/claw-code/rust/target/release/claw --compact --output-format json doctor | head -3
+    {
+      "checks": [
+        {
+    # exit 0 — same JSON as without --compact, no warning
+    $ ~/clawd/claw-code/rust/target/release/claw --compact --output-format json status | jq 'keys'
+    ["kind", "model", "permission_mode", "sandbox", "usage", "workspace"]
+    # --compact flag set to true in parse_args; CliAction::Status has no compact field; value silently dropped
+    $ ~/clawd/claw-code/rust/target/release/claw --compact status
+    Status
+      Model            claude-opus-4-6
+      ...
+    # --compact text + status → same full output as without --compact, silently
+    $ echo "hi" | ~/clawd/claw-code/rust/target/release/claw --compact --output-format json
+    # parses to CliAction::Prompt with compact HARDCODED to false at main.rs:614, regardless of the user-supplied --compact
+    $ ~/clawd/claw-code/rust/target/release/claw --help | grep -A1 "compact"
+      --compact                  Strip tool call details; print only the final assistant text (text mode only; useful for piping)
+    # help explicitly says "text mode only" — but implementation never errors or warns when used elsewhere
+    ```
+
+    **Trace path.**
+    - `rust/crates/rusty-claude-cli/src/main.rs:101` — `--compact` is recognized by the completion list.
+    - `rust/crates/rusty-claude-cli/src/main.rs:406` — `let mut compact = false;` in parse_args.
+    - `rust/crates/rusty-claude-cli/src/main.rs:483-487` — `"--compact" => { compact = true; index += 1; }`. No dependency on output_format or subcommand.
+    - `rust/crates/rusty-claude-cli/src/main.rs:602-618` — stdin-piped fallthrough (`!std::io::stdin().is_terminal()`) constructs `CliAction::Prompt { ..., compact: false, ... }`. **The CLI's `compact: true` is silently dropped here** — `compact` from parse_args is visible in scope but not used.
+    - `rust/crates/rusty-claude-cli/src/main.rs:220-234` — `CliAction::Prompt` dispatch calls `cli.run_turn_with_output(&effective_prompt, output_format, compact)`. Compact is honored *only* here.
+    - `rust/crates/rusty-claude-cli/src/main.rs:3807-3817` — `run_turn_with_output`:
+      ```rust
+      match output_format {
+          CliOutputFormat::Text if compact => self.run_prompt_compact(input),
+          CliOutputFormat::Text => self.run_turn(input),
+          CliOutputFormat::Json => self.run_prompt_json(input),
+      }
+      ```
+      **The JSON branch ignores compact.** No third arm for `CliOutputFormat::Json if compact`, no error, no warning.
+    - `rust/crates/rusty-claude-cli/src/main.rs:646-680` — subcommand dispatch for `agents` / `mcp` / `skills` / `init` / `export` / etc. constructs `CliAction::Agents { args, output_format }`, `CliAction::Mcp { args, output_format }`, etc. — **none of these variants carry a `compact` field**. The flag is accepted by parse_args, held in scope, and then silently dropped when dispatch picks a non-Prompt action.
+    - `rust/crates/rusty-claude-cli/src/main.rs:752-759` — the `parse_single_word_command_alias` branch for `status` / `sandbox` / `doctor` also drops `compact`; `CliAction::Status { model, permission_mode, output_format }`, `CliAction::Sandbox { output_format }`, `CliAction::Doctor { output_format }` have no compact field either.
+    - `rust/crates/rusty-claude-cli/src/main.rs:8251` — `--help` declares "text mode only; useful for piping" — promising behavior the implementation never enforces at the boundary.
+
+    **Why this is specifically a clawability gap.**
+    1. *Documented behavior, silently discarded.* `--help` tells operators the flag applies in "text mode only." That is the honest constraint. But the implementation never refuses non-text use — it just quietly drops the flag. A claw that piped `claw --compact --output-format json "..."` into a downstream parser would reasonably expect the JSON to be compacted (the human-readable `--help` sentence is ambiguous about whether "text mode only" means "ignored in JSON" or "does not apply in JSON, but will be applied if you pass text"). The current behavior is option 1; the documented intent could be read as either.
+    2. *Silent no-op scope is broad.* Nine CliAction variants (Status, Sandbox, Doctor, Init, Export, Mcp, Skills, Agents, plus stdin-piped Prompt) accept `--compact` on the command line, parse it successfully, and throw the value away without surfacing anything. That's a large set of commands that silently lie about flag support.
+    3. *Stdin-piped Prompt hardcodes `compact: false`.* The stdin fallthrough at `:614` constructs `CliAction::Prompt { ..., compact: false, ... }` regardless of the user's `--compact`. This is actively hostile: the user opted in, the flag was parsed, and the value is silently overridden by a hardcoded `false`. A claw running `echo "summarize" | claw --compact "$model"` gets full verbose output, not the piping-friendly compact form advertised in `--help`'s own `claw --compact "summarize Cargo.toml" | wc -l` example.
+    4. *No observable diagnostic.* Neither `status` / `doctor` / the error stream nor the actual JSON output reveals whether `--compact` was honored or dropped. A claw cannot tell from the output shape alone whether the flag worked or was a no-op.
+    5. *Adds to the "silent flag no-op" class.* Sibling of #97 (`--allowedTools ""` silently produces an empty allow-set) and #96 (`--help` Resume-safe summary silently lies about what commands work) — three different flavors of the same underlying problem: flags / surfaces that parse successfully, do nothing useful (or do something harmful), and emit no diagnostic.
+
+    **Fix shape — refuse unsupported combinations at parse time; honor the flag where it is meaningful; log when dropped.**
+    1. *Reject `--compact` with `--output-format json` at parse time.* In `parse_args` after `let allowed_tools = normalize_allowed_tools(...)?`, if `compact && matches!(output_format, CliOutputFormat::Json)`, return `Err("--compact has no effect in --output-format json; drop the flag or switch to --output-format text")`. ~5 lines.
+    2. *Reject `--compact` on non-Prompt subcommands.* In the dispatch match around `main.rs:642-770`, when `compact == true` and the subcommand is `status` / `sandbox` / `doctor` / `init` / `export` / `mcp` / `skills` / `agents` / `system-prompt` / `bootstrap-plan` / `dump-manifests`, return `Err("--compact only applies to prompt turns; the '{cmd}' subcommand does not produce tool-call output to strip")`. ~15 lines + a shared helper to name the subcommand in the error.
+    3. *Honor `--compact` in the stdin-piped Prompt fallthrough.* At `main.rs:614` change `compact: false` to `compact`. One line. Add a parity test: `echo "hi" | claw --compact prompt "..."` should produce the same compact output as `claw --compact prompt "hi"`.
+    4. *Optionally — support `--compact` for JSON mode too.* If the compact-JSON lane is actually useful (strip `tool_uses` / `tool_results` / `prompt_cache_events` and keep only `message` / `model` / `usage`), add a fourth arm to `run_turn_with_output`: `CliOutputFormat::Json if compact => self.run_prompt_json_compact(input)`. Not required for the fix — just a forward-looking note. If not supported, rejection in step 1 is the right answer.
+    5. *Regression tests.* One per rejected combination. One for the stdin-piped-Prompt fix. Lock parser behavior so this cannot silently regress.
+
+    **Acceptance.** `claw --compact --output-format json doctor` exits non-zero with a structured error naming the incompatible combination. `claw --compact status` exits non-zero with an error naming `status` as non-supporting. `echo "hi" | claw --compact prompt "..."` produces the same compact output as the non-piped form. `claw --help`'s "text mode only" promise becomes load-bearing at the parse boundary.
+
+    **Blocker.** None. Parser rejection is ~20 lines across two spots. Stdin fallthrough fix is one line. The optional compact-JSON support is a separate concern.
+
+    **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdM` on main HEAD `7a172a2` in response to Clawhip pinpoint nudge at `1494766926826700921`. Joins the **silent-flag no-op class** with #96 (self-contradicting `--help` surface) and #97 (silent-empty `--allowedTools`) — three variants of "flag parses, produces no useful effect, emits no diagnostic." Distinct from the permission-audit sweep: this is specifically about *flag-scope consistency with documented behavior*, not about what the flag would do if it worked. Natural bundle: **#96 + #97 + #98** covers the full `--help` / flag-validation hygiene triangle — what the surface claims to support, what it silently disables, and what it silently ignores.
