@@ -1730,3 +1730,57 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
    **Blocker.** None. Fix is ~40–60 lines across `mcp_server_details_json` + the text-surface mirror + a tiny secret-heuristic helper + three regression tests (api-key arg redaction, URL basic-auth redaction, headersHelper argv redaction). No MCP runtime behavior changes — the config values still flow unchanged into the MCP client; only the *reporting surface* changes.
 
    **Source.** Jobdori dogfood 2026-04-17 against `/tmp/cdB` on main HEAD `64b29f1` in response to Clawhip pinpoint nudge at `1494706529918517390`. Distinct from both clusters so far. *Not* a truth-audit item (#80–#87, #89): the MCP surface is *accurate* about what's configured; the problem is it's too accurate — it projects secret material it was clearly trying to redact (see the `env_keys` / `header_keys` precedent). *Not* a discovery-overreach item (#85, #88): the surface is scoped to `.claw.json` / `.claw/settings.json`, no ancestor walk involved. First member of a new sub-cluster — "redaction surface is incomplete" — that sits adjacent to both: the output *format* is the bug, not the discovery scope or the diagnostic verdict.
+
+91. **Config accepts 5 undocumented permission-mode aliases (`default`, `plan`, `acceptEdits`, `auto`, `dontAsk`) that silently collapse onto 3 canonical modes — `--permission-mode` CLI flag rejects all 5 — and `"dontAsk"` in particular sounds like "quiet mode" but maps to `danger-full-access`** — dogfooded 2026-04-18 on main HEAD `478ba55` from `/tmp/cdC`. Two independent permission-mode parsers disagree on which labels are valid, and the config-side parser collapses the semantic space silently.
+
+   **Concrete repros — surface disagreement.**
+   ```
+   $ cat .claw.json
+   {"permissions":{"defaultMode":"plan"}}
+   $ claw --output-format json status | jq .permission_mode
+   "read-only"
+
+   $ claw --permission-mode plan --output-format json status
+   {"error":"unsupported permission mode 'plan'. Use read-only, workspace-write, or danger-full-access.","type":"error"}
+   ```
+   Same label, two behaviors, same binary. The config path accepts `plan`, maps it to `ReadOnly`, `doctor` reports `Config: ok`. The CLI-flag path rejects `plan` with a pointed error. An operator reading `--help` sees three modes; an operator reading another operator's `.claw.json` sees a label the binary "accepts" — and silently becomes a different mode than its name suggests.
+
+   **Concrete repros — silent semantic collapse.** `parse_permission_mode_label` at `rust/crates/runtime/src/config.rs:851-862` maps eight labels into three runtime modes:
+   ```rust
+   match mode {
+       "default" | "plan" | "read-only"              => Ok(ResolvedPermissionMode::ReadOnly),
+       "acceptEdits" | "auto" | "workspace-write"    => Ok(ResolvedPermissionMode::WorkspaceWrite),
+       "dontAsk" | "danger-full-access"              => Ok(ResolvedPermissionMode::DangerFullAccess),
+       other => Err(ConfigError::Parse(…)),
+   }
+   ```
+   Five aliases disappear into three buckets:
+    - `"default"` → `ReadOnly`. *"Default of what?"* — reads like a no-op meaning "use whatever the binary considers the default," which on a fresh workspace is `DangerFullAccess` (per #87). The alias therefore *overrides* the fallback to a strictly more restrictive mode, but the name does not tell you that.
+    - `"plan"` → `ReadOnly`. Upstream Claude Code's plan-mode has distinct semantics (agent can reason and call `ExitPlanMode` before acting). `claw`'s runtime has a real `ExitPlanMode` tool in the allowed-tools list (see `--allowedTools` enumeration in `parse_args` error path) but no runtime mode backing it. `"plan"` in config just means "read-only with a misleading name."
+    - `"acceptEdits"` → `WorkspaceWrite`. Reads as "auto-approve edits," actually means "workspace-write (bash and edits both auto-approved under workspace write's tool policy)."
+    - `"auto"` → `WorkspaceWrite`. Ambiguous — does not distinguish from `"acceptEdits"`, and the name could just as reasonably mean `Prompt` or `DangerFullAccess` to a reader.
+    - `"dontAsk"` → `DangerFullAccess`. **This is the dangerous one.** `"dontAsk"` reads like *"I know what I'm doing, stop prompting me"* — which an operator could reasonably assume means "auto-approve routine edits" or "skip permission prompts but keep dangerous gates." It actually means `danger-full-access`: auto-approve **every** tool invocation, including `bash`, `PowerShell`, network-reaching tools. An operator copy-pasting a community snippet containing `"dontAsk"` gets the most permissive mode in the binary without the word "danger" appearing anywhere in their config file.
+
+   **Trace path.**
+    - `rust/crates/runtime/src/config.rs:851-862` — `parse_permission_mode_label` is the config-side parser. Accepts 8 labels. No `#[serde(deny_unknown_variants)]` check anywhere; `config_validate::validate_config_file` does not enforce that `permissions.defaultMode` is one of the canonical three.
+    - `rust/crates/rusty-claude-cli/src/main.rs:5455-5461` — `normalize_permission_mode` is the CLI-flag parser. Accepts 3 labels. Emits a clean error message listing the canonical three when anything else is passed.
+    - `rust/crates/runtime/src/permissions.rs:7-15` — `PermissionMode` enum variants are `ReadOnly`, `WorkspaceWrite`, `DangerFullAccess`, `Prompt`, `Allow`. `Prompt` and `Allow` exist as internal variants but are not reachable via either parser. There is no runtime support for a separate "plan" mode; `ExitPlanMode` exists as a *tool* but has no corresponding `PermissionMode` variant.
+    - `rust/crates/rusty-claude-cli/src/main.rs:4951-4955` — `status` JSON exposes `permission_mode` as the *canonical* string (`"read-only"`, `"workspace-write"`, `"danger-full-access"`). The original label the operator wrote is lost. A claw reading status cannot tell whether `read-only` came from `"read-only"` (explicit) or `"plan"` / `"default"` (collapsed alias) without re-reading the source `.claw.json`.
+
+   **Why this is specifically a clawability gap.**
+    1. *Surface-to-surface disagreement.* Principle #2 ("Truth is split across layers") is violated: the same binary accepts a label in one surface and rejects it in another. An orchestrator that attempts to mirror a lane's config into a child lane via `--permission-mode` cannot round-trip through its own `permissions.defaultMode` if the original uses an alias.
+    2. *`"dontAsk"` is a footgun.* The most permissive mode has the friendliest-sounding alias. No security copy-review step will flag `"dontAsk"` as alarming; it reads like a noise preference. Clawhip / batch orchestrators that replay other operators' configs inherit the full-access escalation without a `danger` keyword ever appearing in the audit trail.
+    3. *Lossy provenance.* `status.permission_mode` reports the collapsed canonical label. A claw that logs its own permission posture cannot reconstruct whether the operator wrote `"plan"` and expected plan-mode behavior, or wrote `"read-only"` intentionally.
+    4. *`"plan"` implies runtime semantics that don't exist.* Writing `"defaultMode": "plan"` is a reasonable attempt to use plan-mode (see `ExitPlanMode` in `--allowedTools` enumeration, see REPL `/plan [on|off]` slash command in `--help`). The config-time collapse to `ReadOnly` means the agent does *not* treat `ExitPlanMode` as a meaningful exit event; a claw relying on `ExitPlanMode` as a typed "agent proposes to execute" signal sees nothing, because the agent was never in plan mode to begin with.
+
+   **Fix shape — three pieces, each small.**
+   1. *Align the two parsers.* Either (a) drop the non-canonical aliases from `parse_permission_mode_label`, or (b) extend `normalize_permission_mode` to accept the same set and emit them canonicalized via a shared helper. Whichever direction, the two surfaces must accept and reject identical strings.
+   2. *Promote provenance in `status`.* Add `permission_mode_raw: "plan"` alongside `permission_mode: "read-only"` so a claw can see the original label. Pair with the existing `permission_mode_source` from #87 so provenance is complete.
+   3. *Kill `"dontAsk"` or warn on it.* Either (a) remove the alias entirely (forcing operators to spell `"danger-full-access"` when they mean it — the name should carry the risk), or (b) keep the alias but have `doctor` emit a `warn` check when `permission_mode_raw == "dontAsk"` that explicitly says "this alias maps to danger-full-access; spell it out to confirm intent." Option (a) is more honest; option (b) is less breaking.
+   4. *Decide whether `"plan"` should map to something real.* Either (a) drop the alias and require operators to use `"read-only"` if that's what they want, or (b) introduce a real `PermissionMode::Plan` runtime variant with distinct semantics (e.g., deny all tools except `ExitPlanMode` and read-only tools) so `"plan"` means plan-mode. Orthogonal to pieces 1–3 and can ship independently.
+
+   **Acceptance.** `claw --permission-mode X` and `{"permissions":{"defaultMode":"X"}}` accept and reject the same set of labels. `claw status --output-format json` exposes `permission_mode_raw` so orchestrators can audit the exact label operators wrote. `"dontAsk"` either disappears from the accepted set or triggers a `doctor warn` with a message that includes the word `danger`.
+
+   **Blocker.** None. Pieces 1–3 are ~20–30 lines across the two parsers and the status JSON builder. Piece 4 (real plan-mode) is orthogonal and can ship independently.
+
+   **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdC` on main HEAD `478ba55` in response to Clawhip pinpoint nudge at `1494714078965403848`. Second member of the "redaction-surface / reporting-surface is incomplete" sub-cluster after #90, and a direct sibling of #87 ("permission mode source invisible"): #87 is "fallback vs explicit" provenance loss; #91 is "alias vs canonical" provenance loss. Together with #87 they pin the permission-reporting surface from two angles. Different axis from the truth-audit cluster (#80–#86, #89): here the surface is not reporting a wrong value — it is canonicalizing an alias losslessly *and silently* in a way that loses the operator's intent.
