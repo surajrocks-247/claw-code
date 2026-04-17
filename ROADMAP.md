@@ -2527,3 +2527,90 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. The cheapest tier (`which` / absolute-path existence check) is ~10 lines per server transport class and closes the "command doesn't exist on disk" gap entirely. Deeper handshake probes can be added later behind an opt-in `--probe` flag.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdW2` on main HEAD `eabd257` in response to Clawhip pinpoint nudge at `1494797126041862285`. Joins the **unplumbed-subsystem** cross-cluster with #78 (`claw plugins` route never constructed) and #100 (stale-base JSON-invisible) — same shape: machinery exists, diagnostic surface doesn't expose it. Joins **truth-audit / diagnostic-integrity** (#80-#84, #86, #87, #89, #100) because `doctor: ok` is a lie when MCP servers are unreachable. Directly implements the roadmap's own Phase 1 §3.5 (boot preflight), Phase 2 §4 (canonical lane events), Phase 4.4.4 (event provenance), and Product Principle #5 (partial success is first-class). Natural bundle: **#78 + #100 + #102** (unplumbed-surface quartet, now with #96) — four surfaces where the subsystem exists but the JSON diagnostic doesn't expose it; tight family PR. Also **#100 + #102** as the pure "doctor surface coverage" 2-way: #100 surfaces commit identity, #102 surfaces MCP reachability, together they let `claw doctor` actually live up to its name.
+
+103. **`claw agents` silently discards every agent definition that is not a `.toml` file — including `.md` files with YAML frontmatter, which is the Claude Code convention that most operators will reach for first. A `.claw/agents/foo.md` file is silently skipped by the agent-discovery walker; `agents list` reports zero agents; doctor reports ok; neither `agents help` nor `--help` nor any docs mention that `.toml` is the accepted format — the gate is entirely code-side and invisible at the operator layer. Compounded by the agent loader not validating *any* of the values inside a discovered `.toml` (model names, tool names, reasoning effort levels) — so the `.toml` gate filters *form* silently while downstream ignores *content* silently** — dogfooded 2026-04-18 on main HEAD `6a16f08` from `/tmp/cdX`. A `.claw/agents/broken.md` with claude-code-style YAML frontmatter is invisible to `agents list`. The same content moved into `.claw/agents/broken.toml` is loaded instantly — including when it references `model: "nonexistent/model-that-does-not-exist"` and `tools: ["DoesNotExist", "AlsoFake"]`, both of which are accepted without complaint.
+
+     **Concrete repro.**
+     ```
+     $ mkdir -p /tmp/cdX/.claw/agents
+     $ cat > /tmp/cdX/.claw/agents/broken.md << 'MD'
+     ---
+     name: broken
+     description: Test agent with garbage
+     model: nonexistent/model-that-does-not-exist
+     tools: ["DoesNotExist", "AlsoFake"]
+     ---
+     You are a test agent.
+     MD
+
+     $ claw --output-format json agents list | jq '{count, agents: .agents | length, summary}'
+     {"count": 0, "agents": 0, "summary": {"active": 0, "shadowed": 0, "total": 0}}
+     # .md file silently skipped — no log, no warning, no doctor signal
+
+     $ claw --output-format json doctor | jq '.has_failures, .summary'
+     false
+     {"failures": 0, "ok": 4, "total": 6, "warnings": 2}
+     # doctor: clean
+
+     # Now rename the SAME content to .toml:
+     $ mv /tmp/cdX/.claw/agents/broken.md /tmp/cdX/.claw/agents/broken.toml
+     # ... (adjusting content to TOML syntax instead of YAML frontmatter)
+     $ cat > /tmp/cdX/.claw/agents/broken.toml << 'TOML'
+     name = "broken"
+     description = "Test agent with garbage"
+     model = "nonexistent/model-that-does-not-exist"
+     tools = ["DoesNotExist", "AlsoFake"]
+     TOML
+     $ claw --output-format json agents list | jq '.agents[0] | {name, model}'
+     {"name": "broken", "model": "nonexistent/model-that-does-not-exist"}
+     # File format (.toml) passes the gate. Garbage content (nonexistent model,
+     # fake tool names) is accepted without validation.
+
+     $ claw --output-format json agents help | jq '.usage'
+     {
+       "direct_cli": "claw agents [list|help]",
+       "slash_command": "/agents [list|help]",
+       "sources": [".claw/agents", "~/.claw/agents", "$CLAW_CONFIG_HOME/agents"]
+     }
+     # Help lists SOURCES but not the required FILE FORMAT.
+     ```
+
+     **Trace path.**
+     - `rust/crates/commands/src/lib.rs:3180-3220` — `load_agents_from_roots`:
+       ```rust
+       for entry in fs::read_dir(root)? {
+           let entry = entry?;
+           if entry.path().extension().is_none_or(|ext| ext != "toml") {
+               continue;
+           }
+           let contents = fs::read_to_string(entry.path())?;
+           // ... parse_toml_string(&contents, "name") etc.
+       }
+       ```
+       The `extension() != "toml"` check silently drops every non-TOML file. No log. No warning. No collection of skipped-file names for later display. `grep -rn 'extension().*"md"\|parse_yaml_frontmatter\|yaml_frontmatter' rust/crates/commands/src/lib.rs` — zero hits. No code anywhere reads `.md` as an agent source.
+     - `rust/crates/commands/src/lib.rs` — `parse_toml_string(&contents, "name")` — falls back to filename stem if parsing fails. Thus a `.toml` file that is *not actually TOML* would still be "discovered" with the filename as the name. `parse_toml_string` presumably handles `description`/`model`/`reasoning_effort` similarly. No structural validation.
+     - `rust/crates/commands/src/lib.rs` — no validation of `model` against a known-model list, no validation of `tools[]` entries against the canonical tool registry (the registry exists, per #97). Garbage model names and nonexistent tool names flow straight into the `AgentSummary`.
+     - The `agents help` output emitted at `commands/src/lib.rs` (rendered via `render_agents_help`) exposes the three search roots but *not* the required file extension. A claude-code-migrating operator who drops a `.md` file into `.claw/agents/` gets silent failure and no help-surface hint.
+     - Skills use `.md` via `SKILL.md`, scanned at `commands/src/lib.rs:3229-3260`. MCP uses `.json` via `.claw.json`. Agents use `.toml`. Three subsystems, three formats, zero consistency documentation; only one of them silently discards the claude-code-convention format.
+
+     **Why this is specifically a clawability gap.**
+     1. *Silent-discard discovery.* Same family as the #96/#97/#98/#99/#100/#101/#102 silent-failure class, now on the agent-registration axis. An operator thinks they defined an agent; claw thinks no agent was defined; doctor says ok. The ground truth mismatch surfaces only when the agent tries to invoke `/agent spawn broken` and the name isn't resolvable — and even then the error is "agent not found" rather than "agent file format wrong."
+     2. *Claude Code convention collision.* The Anthropic Claude Code reference for agents uses `.md` with YAML frontmatter. Migrating operators copy that convention over. claw-code silently drops their files. There is no migration shim, no "we detected 1 .md file in .claw/agents/ but we only read .toml; did you mean to use TOML format? see docs/agents.md" warning.
+     3. *Help text is incomplete.* `agents help` lists search directories but not the accepted file format. The operator has nothing documentation-side to diagnose "why does `.md` not work?" without reading source.
+     4. *No content validation inside accepted files.* Even when the `.toml` gate lets a file through, claw does not validate `model` against the model registry, `tools[]` against the tool registry, `reasoning_effort` against the valid `low|medium|high` set (#97 validated tools for CLI flag but not here). Garbage-in, garbage-out: the agent definition is accepted, stored, listed, and will only fail when actually invoked.
+     5. *Doctor has no agent check.* The doctor check set is `auth / config / install_source / workspace / sandbox / system`. No `agents` check surfaces "3 files in .claw/agents, 2 accepted, 1 silently skipped because format." Pairs directly with #102's missing `mcp` check — both are doctor-coverage gaps on subsystems that are already implemented.
+     6. *Format asymmetry undermines plugin authoring.* A plugin or skill author who writes an `.md` agent file for distribution (to match the broader Claude Code ecosystem) ships a file that silently does nothing in every claw-code workspace. The author gets no feedback; the users get no signal. A migration path from claude-code → claw-code for agent definitions is effectively silently broken.
+
+     **Fix shape — accept `.md` (YAML frontmatter) as an agent source, validate contents, surface skipped files in doctor.**
+     1. *Accept `.md` with YAML frontmatter.* Extend `load_agents_from_roots` to also read `.md` files. Reuse the same `parse_skill_frontmatter` helper that skills discovery at `:3229` already uses. If both `foo.toml` and `foo.md` exist, prefer `.toml` but record a `conflict: true` flag in the summary. ~30 lines.
+     2. *Validate agent content against registries.* Check `model` is a known alias or provider/model string. Check `tools[]` entries exist in the canonical tool registry (shared with #97's proposed validation). Check `reasoning_effort` is in `low|medium|high`. On failure, include the agent in the list with `status: "invalid"` and a `validation_errors` array. Do not silently drop. ~40 lines.
+     3. *Emit skipped-file counts in `agents list`.* Add `summary: {total, active, shadowed, skipped: [{path, reason}]}` so an operator can see that their `.md` file was not a `.toml` file. ~10 lines.
+     4. *Add an `agents` doctor check.* Sum across roots: total files present, format-skipped, parse-errored, validation-invalid, active. Emit warn if any files were skipped or parse-failed. ~25 lines.
+     5. *Update `agents help` to name the accepted file formats.* Add an `accepted_formats: [".toml", ".md (YAML frontmatter)"]` field to the help JSON and mention it in text-mode help. ~5 lines.
+     6. *Regression tests.* One per format. One for shadowing between `.toml` and `.md`. One for garbage model/tools content. One for doctor-check agent-skipped signal.
+
+     **Acceptance.** `claw --output-format json agents list` with a `.claw/agents/foo.md` file exposes the agent (or exposes it with `status: "invalid"` if the frontmatter is malformed) instead of silently dropping it. `claw doctor` emits an `agents` check reporting total/active/skipped counts and a warn status when any file was skipped or parse-failed. `agents help` documents the accepted file formats. Garbage `model`/`tools[]` values surface as `validation_errors` in the agent summary rather than being stored and only failing at invocation.
+
+     **Blocker.** None. Three-source agent discovery (`.toml`, `.md`, shared helpers) is ~30 lines. Content validation using existing tool-registry + model-alias machinery is ~40 lines. Doctor check is ~25 lines. All additive; no breaking changes for existing `.toml`-only configs.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdX` on main HEAD `6a16f08` in response to Clawhip pinpoint nudge at `1494804679962661187`. Joins **truth-audit / diagnostic-integrity** (#80-#84, #86, #87, #89, #100, #102) on the agent-discovery axis: another "subsystem silently reports ok while ignoring operator input." Joins **silent-flag / documented-but-unenforced** (#96-#101) on the silent-discard dimension (but subsystem-scale rather than flag-scale). Joins **unplumbed-subsystem** (#78, #96, #100, #102) as the fifth surface with machinery present but operator-unreachable: `load_agents_from_roots` exists, `parse_skill_frontmatter` exists (used for skills), validation helpers exist (used for `--allowedTools`) — the agents path just doesn't call any of them beyond TOML parsing. Natural bundle: **#102 + #103** (subsystem-doctor-coverage 2-way — MCP liveness + agent-format validity); also **#78 + #96 + #100 + #102 + #103** as the unplumbed-surface quintet. And cross-cluster with **Claude Code migration parity** (no other ROADMAP entry captures this yet) — claw-code silently breaks an expected migration path for a first-class subsystem.
