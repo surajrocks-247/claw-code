@@ -1337,3 +1337,42 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
    **Blocker.** None. Option (a) touches `session_control.rs:32-40` (swap the fingerprint input) plus the existing `from_cwd` call sites to pass through a resolved project root; option (b) is pure output surface in the status command. Tests already exercise `SessionStore::from_cwd` at multiple CWDs (`session_control.rs:748-757`) — extend them to cover the project-root-vs-CWD case.
 
    **Source.** Jobdori dogfood 2026-04-17 against `~/clawd/claw-code` (self) and `/tmp/claw-split-17` on main HEAD `a48575f` in response to Clawhip pinpoint nudge at `1494638583481372833`. Distinct from ROADMAP #80 (error-copy accuracy within a single partition) — this is the partition-identity gap one layer up: two CWDs both think they are in the same project but live in disjoint session namespaces.
+
+82. **`claw sandbox` advertises `filesystem_active=true, filesystem_mode=workspace-only` on macOS but the "isolation" is just `HOME`/`TMPDIR` env-var rebasing — subprocesses can still write anywhere on disk** — dogfooded 2026-04-17 on main HEAD `1743e60` against `/tmp/claw-dogfood-2`. `claw --output-format json sandbox` on macOS reports `{"supported":false, "active":false, "filesystem_active":true, "filesystem_mode":"workspace-only", "fallback_reason":"namespace isolation unavailable (requires Linux with `unshare`)"}`. The `fallback_reason` correctly admits namespace isolation is off, but `filesystem_active=true` + `filesystem_mode="workspace-only"` reads — to a claw or a human — as *"filesystem isolation is live, restricted to the workspace."* It is not.
+
+   **What `filesystem_active` actually does on macOS.** `rust/crates/runtime/src/bash.rs:205-209` (sync path) and `:228-232` (tokio path) both read:
+   ```rust
+   if sandbox_status.filesystem_active {
+       prepared.env("HOME", cwd.join(".sandbox-home"));
+       prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
+   }
+   ```
+   That is the *entire* enforcement outside Linux `unshare`. No `chroot`, no App Sandbox, no Seatbelt (`sandbox-exec`), no path filtering, no write-prevention at the syscall layer. The `build_linux_sandbox_command` call one level above (`sandbox.rs:210-220`) short-circuits on non-Linux because `cfg!(target_os = "linux")` is false, so the Linux branch never runs.
+
+   **Direct escape proof.** From `/tmp/claw-dogfood-2` I ran exactly what `bash.rs` sets up for a subprocess:
+   ```sh
+   HOME=/tmp/claw-dogfood-2/.sandbox-home \
+   TMPDIR=/tmp/claw-dogfood-2/.sandbox-tmp \
+     sh -lc 'echo "CLAW WORKSPACE ESCAPE PROOF" > /tmp/claw-escape-proof.txt; mkdir /tmp/claw-probe-target'
+   ```
+   Both writes succeeded (`/tmp/claw-escape-proof.txt` and `/tmp/claw-probe-target/`) — outside the advertised workspace, under `sandbox_status.filesystem_active = true`. Any tool that uses absolute paths, any command that includes `~` after reading `HOME`, any `tmpfile(3)` call that does not honor `TMPDIR`, any subprocess that resets its own env, any symlink that escapes the workspace — all of those defeat "workspace-only" on macOS trivially. This is not a sandbox; it is an env-var hint.
+
+   **Why this is specifically a clawability problem.** The `Sandbox` block in `claw status` / `claw doctor` is machine-readable state that clawhip / batch orchestrators will trust. ROADMAP Principle #5 ("Partial success is first-class — degraded-mode reporting") explicitly calls out that the sandbox status surface should distinguish *active* from *degraded*. Today's surface on macOS is the worst of both worlds: `active=false` (honest), `supported=false` (honest), `fallback_reason` set (honest), but `filesystem_active=true, filesystem_mode="workspace-only"` (misleading — same boolean name a Linux reader uses to mean "writes outside the workspace are blocked"). A claw that reads the JSON and branches on `filesystem_active && filesystem_mode == "workspace-only"` will believe it is safe to let a worker run shell commands that touch `/tmp`, `$HOME`, etc. It isn't.
+
+   **Trace path.**
+    - `rust/crates/runtime/src/sandbox.rs:164-170` — `namespace_supported = cfg!(target_os = "linux") && unshare_user_namespace_works()`. On macOS this is always false.
+    - `rust/crates/runtime/src/sandbox.rs:165-167` — `filesystem_active = request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off`. The computation does *not* require namespace support; it's just "did the caller ask for filesystem isolation and did they not ask for Off." So on macOS with a default config, `filesystem_active` stays true even though the only enforcement mechanism (`build_linux_sandbox_command`) returns `None`.
+    - `rust/crates/runtime/src/sandbox.rs:210-220` — `build_linux_sandbox_command` is gated on `cfg!(target_os = "linux")`. On macOS it returns `None` unconditionally.
+    - `rust/crates/runtime/src/bash.rs:183-211` (sync) / `:213-239` (tokio) — when `build_linux_sandbox_command` returns `None`, the fallback is `sh -lc <command>` with only `HOME` + `TMPDIR` env rewrites when `filesystem_active` is true. That's it.
+
+   **Fix shape — two options, neither huge.**
+
+   *Option A — honesty on the reporting side (low-risk, ~15 lines).* Compute `filesystem_active` as `request.enabled && request.filesystem_mode != Off && namespace_supported` on platforms where `build_linux_sandbox_command` is the only enforcement path. On macOS the new effective `filesystem_active` becomes `false` by default, `filesystem_mode` keeps reporting the *requested* mode, and the existing `fallback_reason` picks up a new entry like `"filesystem isolation unavailable outside Linux (sandbox-exec not wired up)"`. A claw now sees `filesystem_active=false` and correctly branches to "no enforcement, ask before running." This is purely a reporting change: `bash.rs` still does its `HOME`/`TMPDIR` rewrite as a soft hint, but the status surface no longer lies.
+
+   *Option B — actual macOS enforcement (bigger, but correct).* Wire a `build_macos_sandbox_command` that wraps the child in `sandbox-exec -p '<profile>'` with a Seatbelt profile that allows reads everywhere (current Seatbelt policy) and restricts writes to `cwd`, the sandbox-home, the sandbox-tmp, and whatever is in `allowed_mounts`. Seatbelt is deprecated-but-working, ships with macOS, and is how `nix-shell`, `homebrew`'s sandbox, and `bwrap`-on-mac approximations all do this. Probably 80–150 lines including a profile template and tests.
+
+   **Acceptance.** Running the escape-proof snippet above from a `claw` child process on macOS either (a) cannot write outside the workspace (Option B), or (b) the `sandbox` status surface no longer claims `filesystem_active=true` in a state where writes outside the workspace succeed (Option A). Regression test: spawn a child via `prepare_command` / `prepare_tokio_command` on macOS with default `SandboxConfig`, attempt `echo foo > /tmp/claw-escape-test-<uuid>`, assert that either the write fails (B) or `SandboxStatus.filesystem_active == false` at status time (A).
+
+   **Blocker.** None for Option A. Option B depends on agreeing to ship a Seatbelt profile and accepting the "deprecated API" maintenance burden — orthogonal enough that it shouldn't block the honesty fix.
+
+   **Source.** Jobdori dogfood 2026-04-17 against `/tmp/claw-dogfood-2` on main HEAD `1743e60` in response to Clawhip pinpoint nudge at `1494646135317598239`. Adjacent family: ROADMAP principle #5 (degraded-mode should be first-class + machine-readable) and #6 (human UX leaks into claw workflows — here, a status field that *looks* boolean-correct but carries platform-specific semantics). Filed under the same reporting-integrity heading as #77 (missing `ErrorKind`) and #80 (error copy lies about search path): the surface says one thing, the runtime does another.
