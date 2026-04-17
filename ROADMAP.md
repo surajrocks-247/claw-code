@@ -1528,3 +1528,39 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
    **Blocker.** None. Fix is ~20–30 lines in two files (`runtime/src/config.rs` + `rusty-claude-cli/src/main.rs`) plus three regression tests.
 
    **Source.** Jobdori dogfood 2026-04-17 against `/tmp/cd7` on main HEAD `586a92b` in response to Clawhip pinpoint nudge at `1494676332507041872`. Sibling to #80–#84 (surface lies about runtime truth): here the surface is the config-health diagnostic, and the lie is a legacy-compat swallow that was meant to tolerate historical `.claw.json` files but now masks live user-written typos. Distinct from #85 (discovery-overreach) — that one is the discovery *path* reaching too far; this one is the *load* path silently dropping a file that is clearly in scope.
+
+87. **Fresh workspace default `permission_mode` is `danger-full-access` with zero warning in `claw doctor` and no auditable trail of how the mode was chosen — every unconfigured claw spawn runs fully unattended at maximum permission** — dogfooded 2026-04-17 on main HEAD `d6003be` against `/tmp/cd8`. A fresh workspace with no `.claw.json`, no `RUSTY_CLAUDE_PERMISSION_MODE` env var, no `--permission-mode` flag produces:
+   ```
+   claw status | grep Permission
+   # Permission mode  danger-full-access
+
+   claw --output-format json status | jq .permission_mode
+   # "danger-full-access"
+
+   claw doctor | grep -iE 'permission|danger'
+   # <empty>
+   ```
+   `doctor` has no permission-mode check at all. The most permissive runtime mode claw ships with is the silent default, and the single machine-readable surface that preflights a lane (`doctor`) never mentions it.
+
+   **Trace path.**
+    - `rust/crates/rusty-claude-cli/src/main.rs:1099-1107` — `fn default_permission_mode()` returns, in priority order: (1) `RUSTY_CLAUDE_PERMISSION_MODE` env var if set and valid; (2) `permissions.defaultMode` from config if loaded; (3) `PermissionMode::DangerFullAccess`. No warning printed when the fallback hits; no evidence anywhere that the mode was chosen by fallback versus by explicit config.
+    - `rust/crates/runtime/src/permissions.rs:7-15` — `PermissionMode` ordinal is `ReadOnly < WorkspaceWrite < DangerFullAccess < Prompt < Allow`. The `current_mode >= required_mode` gate at `:260-264` means `DangerFullAccess` auto-approves every tool spec whose `required_permission` is `DangerFullAccess` or below — which includes `bash` and `PowerShell` (see ROADMAP #50). No prompt, no audit, no confirmation.
+    - `rust/crates/rusty-claude-cli/src/main.rs:1895-1910` (`check_sandbox_health`) — the doctor block surfaces **sandbox** state as a first-class diagnostic, correctly emitting `warn` when sandbox is enabled but not active. No parallel `check_permission_health` exists. Permission mode is a single line in `claw status`'s text output and a single top-level field in the JSON — nowhere in `doctor`, nowhere in `state`, nowhere in any preflight.
+    - `rust/crates/rusty-claude-cli/src/main.rs:4951-4955` — `status` JSON surfaces `"permission_mode": "danger-full-access"` but has no companion field like `permission_mode_source` to distinguish env-var / config / fallback. A claw reading status cannot tell whether the mode was chosen deliberately or fell back by default.
+
+   **Why this is specifically a clawability gap.** This is the flip-side of the #80–#86 "surface lies about runtime truth" cluster: here the surface is *silent* about a runtime truth that meaningfully changes what the worker can do. Concretely:
+    1. *No preflight signal.* ROADMAP section 3.5 ("Boot preflight / doctor contract") explicitly requires machine-readable preflight to surface state that determines whether a lane is safe to start. Permission mode is precisely that kind of state — a lane at `danger-full-access` has a larger blast radius than one at `workspace-write` — and `doctor` omits it entirely.
+    2. *No provenance.* A clawhip orchestrator spawning 20 lanes has no way to distinguish "operator intentionally set `defaultMode: danger-full-access` in the shared config" from "config was missing or typo'd (see #86) and all 20 workers silently fell back to `danger-full-access`." The two outcomes are observably identical at the status layer.
+    3. *Least-privilege inversion.* For an `interactive` harness a permissive default is defensible; for a *batch claw harness* it inverts the normal least-privilege principle. A worker should have to *opt in* to full access, not have it handed to them when config is missing.
+    4. *Interacts badly with #86.* A corrupted `.claw.json` that specifies `permissions.defaultMode: "plan"` is silently dropped, and the fallback reverts to `danger-full-access` with `doctor` reporting `Config: ok`. So the same typo path that wipes a user's permission choice also escalates them to maximum permission, and nothing in the diagnostic surface says so.
+
+   **Fix shape — three pieces, each small.**
+   1. *Add a `permission` (or `permissions`) doctor check.* Mirror `check_sandbox_health`'s shape: emit `DiagnosticLevel::Warn` when the effective mode is `DangerFullAccess` *and* the mode was chosen by fallback (not by explicit env / config / CLI flag). Emit `DiagnosticLevel::Ok` otherwise. Detail lines should include the effective mode, the source (`fallback` / `env:RUSTY_CLAUDE_PERMISSION_MODE` / `config:.claw.json` / `cli:--permission-mode`), and the set of tools whose `required_permission` the current mode satisfies.
+   2. *Surface `permission_mode_source` in `status` JSON.* Alongside the existing `permission_mode` field, add `permission_mode_source: "fallback" | "env" | "config" | "cli"`. `fn default_permission_mode` becomes `fn resolve_permission_mode() -> (PermissionMode, PermissionModeSource)`. No behavior change; just provenance a claw can audit.
+   3. *Consider flipping the fallback default.* For the subset of invocations that are clearly non-interactive (`--output-format json`, `--resume`, piped stdin) make the fallback `WorkspaceWrite` or `Prompt`, and require an explicit flag / config / env var to escalate to `DangerFullAccess`. Keep `DangerFullAccess` as the interactive-REPL default if that is the intended philosophy, but *announce* it via the new doctor check so a claw can branch on it. This third piece is a judgment call and can ship separately from pieces 1+2.
+
+   **Acceptance.** `claw --output-format json doctor` emits a `permission` check with the effective mode and its source, and flags `warn` when the mode is `danger-full-access` via fallback; `claw --output-format json status` exposes `permission_mode_source` so an orchestrator can branch on "was this explicit or implicit"; a clawhip preflight that gates on `doctor[*].status != "ok"` trips on an unattended full-access fallback without needing to scrape the text surface.
+
+   **Blocker.** None. Pieces 1 and 2 are ~30–40 lines across `default_permission_mode` (return a tuple), the `status` JSON builder, and a new `check_permission_health` function mirroring `check_sandbox_health`. Piece 3 (flipping the fallback) is orthogonal and can ship independently or be deferred indefinitely.
+
+   **Source.** Jobdori dogfood 2026-04-17 against `/tmp/cd8` on main HEAD `d6003be` in response to Clawhip pinpoint nudge at `1494683886658257071`. Second member of the "doctor surface fails to carry machine-readable runtime state" sub-cluster after #86 (config parse failure silently dropped). Adjacent to #50 (tool-spec over-escalation for `bash` / `PowerShell`): #50 is "the required_permission is too high for some commands," #87 is "the current_permission is too high by default when config is absent." Together they pin the permission surface from both ends.
