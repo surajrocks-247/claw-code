@@ -1933,3 +1933,58 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
    **Blocker.** None. Tool-name validation is ~10–15 lines reusing the existing `--allowedTools` registry. Case-fold is one `eq_ignore_ascii_case` call site. Status JSON exposure is ~20–30 lines with a new `permission_rules_json` helper mirroring the existing `mcp_server_details_json` shape.
 
    **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdI` on main HEAD `7f76e6b` in response to Clawhip pinpoint nudge at `1494736729582862446`. Stacks three independent failures on the permission-rule surface: (a) typo-accepting parser (truth-audit / diagnostic-integrity flavor — sibling of #86), (b) case-sensitive matcher against lowercase runtime names (reporting-surface / config-hygiene flavor — sibling of #91's alias-collapse), (c) rules invisible in every diagnostic surface (sibling of #87 permission-mode-source invisibility). Shares the permission-audit PR bundle alongside #50 / #87 / #91 — all four plug the same surface from different angles.
+
+95. **`claw skills install <path>` always writes to the *user-level* registry (`~/.claw/skills/`) with no project-level scope, no uninstall subcommand, and no per-workspace confirmation — a skill installed from one workspace silently becomes active in every other workspace on the same machine** — dogfooded 2026-04-18 on main HEAD `b7539e6` from `/tmp/cdJ`. The install registry defaults to `$HOME/.claw/skills/`, the install subcommand has no sibling `uninstall` (only `/skills [list|install|help]` — no remove verb), and the installed skill is immediately visible as `active: true` under `source: user_claw` from every `claw` invocation on the same account.
+
+   **Concrete repro — cross-workspace leak.**
+   ```sh
+   mkdir -p /tmp/test-leak-skill && cat > /tmp/test-leak-skill/SKILL.md <<'EOF'
+   ---
+   name: leak-test
+   description: installed from workspace A
+   ---
+   # leak-test
+   EOF
+
+   cd /tmp/workspace-A && claw skills install /tmp/test-leak-skill
+   # Skills
+   #   Result           installed leak-test
+   #   Invoke as        $leak-test
+   #   Registry         /Users/yeongyu/.claw/skills
+   #   Installed path   /Users/yeongyu/.claw/skills/leak-test
+
+   cd /tmp/workspace-B && claw --output-format json skills | jq '.skills[] | select(.name=="leak-test")'
+   # {"active": true, "description": "installed from workspace A",
+   #  "name": "leak-test", "source": {"id": "user_claw", "label": "User home roots"}, ...}
+   ```
+   The operator is *not* prompted about scope (project vs user), there is no `--project` / `--user` flag, and the install does not emit any warning that the skill is now active in every unrelated workspace on the same account.
+
+   **Concrete repro — no uninstall.**
+   ```sh
+   claw skills uninstall leak-test
+   # error: missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN ...
+   # (falls through to prompt-dispatch path, because 'uninstall' is not a registered skills subcommand)
+   ```
+   `claw --help` enumerates `/skills [list|install <path>|help|<skill> [args]]` — no `uninstall`. The REPL `/skill` slash surface is identical. Removing a bad skill requires manually `rm -rf ~/.claw/skills/<name>/`, which is exactly the text-scraped terminal recovery path ROADMAP principle #6 ("Terminal is transport, not truth") argues against.
+
+   **Trace path.**
+    - `rust/crates/commands/src/lib.rs:2956-3000` — `install_skill(source, cwd)` calls `default_skill_install_root()` with no `cwd` consultation. That helper returns `$CLAW_CONFIG_HOME/skills` → `$CODEX_HOME/skills` → `$HOME/.claw/skills`, all of them *user-level*. There is no `.claw/skills/` (project-scope) code path in the install writer.
+    - `rust/crates/commands/src/lib.rs:2388-2420` — `handle_skills_slash_command_json` routes `None | Some("list") → list`, `Some("install") | Some(args.starts_with("install ")) → install`, `is_help_arg → usage`, anything else → usage. No `uninstall` / `remove` / `delete` branch. The only way to remove an installed skill is out-of-band filesystem manipulation.
+    - `rust/crates/commands/src/lib.rs:2870-2945` — discovery walks all user-level sources (`$HOME/.claw`, `$HOME/.omc`, `$HOME/.claude`, `$HOME/.codex`) unconditionally. Once a skill lands in any of those dirs, it's active everywhere.
+
+   **Why this is specifically a clawability gap.**
+    1. *Least-privilege / least-scope inversion for skill surface.* A skill is live code the agent can invoke via slash-dispatch. Installing "this workspace's skill" into user scope by default is the skill analog of setting `permission_mode=danger-full-access` without asking — the default widens the blast radius beyond what the operator probably intended.
+    2. *No round-trip.* A clawhip orchestrator that installs a skill for a lane, runs the lane, and wants to clean up has no machine-readable way to remove the skill it just installed. Forces orchestrators to shell out to `rm -rf` on a path they parsed out of the install output's `Installed path` line.
+    3. *Cross-workspace contamination.* Any mistake in one workspace's skill install pollutes every other workspace on the same account. Doubly compounds with #85 (skill discovery walks ancestors unbounded) — an attacker who can write under an ancestor OR who can trick the operator into one bad `skills install` in any workspace lands a skill in the user-level registry that's now active in every future `claw` invocation.
+    4. *Runs contrary to the project/user split ROADMAP already uses for settings.* `.claw/settings.local.json` is explicitly gitignored and explicitly project-local (`ConfigSource::Local`). Settings have a three-tier scope (`User` / `Project` / `Local`). Skills collapse all three tiers onto `User` at install time. The asymmetry makes the "project-scoped" mental model operators build from settings break when they reach skills.
+
+   **Fix shape — three pieces, each small.**
+   1. *Add a `--scope` flag to `claw skills install`.* `--scope user` (current default behavior), `--scope project` (writes to `<cwd>/.claw/skills/<name>/`), `--scope local` (writes to `<cwd>/.claw/skills/<name>/` and adds an entry to `.claw/settings.local.json` if needed). Default: **prompt** the operator in interactive use, error-out with `--scope must be specified` in `--output-format json` use. Let orchestrators commit to a scope explicitly.
+   2. *Add `claw skills uninstall <name>` and `/skills uninstall <name>` slash-command.* Shares a helper with install; symmetric semantics; `--scope` aware; emits a structured JSON result identical in shape to the install receipt. Covers the machine-readable round-trip that #95 is missing.
+   3. *Surface the install scope in `claw skills` list output.* The current `source: user_claw / Project roots / etc.` label is close but collapses multiple physical locations behind a single bucket. Add `installed_path` to each skill record so an orchestrator can tell *"this one came from my workspace / this one is inherited from user home / this one is pulled in via ancestor walk (#85)."* Pairs cleanly with the #85 ancestor-walk bound — together the skill surface becomes auditable across scope.
+
+   **Acceptance.** `claw skills install /tmp/x --scope project` writes to `<cwd>/.claw/skills/x/` and does *not* make the skill active in any other workspace. `claw skills uninstall x` removes the skill it just installed without shelling out to `rm -rf`. `claw --output-format json skills` exposes `installed_path` per entry so orchestrators can audit which physical location produced the listing.
+
+   **Blocker.** None. Install-scope flag is ~20 lines in `install_skill_into` signature + `handle_skills_slash_command` arg parsing. Uninstall is another ~30 lines mirroring install semantics. `installed_path` exposure is ~5 lines in the JSON builder. Full scope (scoping + uninstall + path surfacing) is ~60 lines + tests.
+
+   **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdJ` on main HEAD `b7539e6` in response to Clawhip pinpoint nudge at `1494744278423961742`. Adjacent to #85 (skill discovery ancestor walk) on the *discovery* side — #85 is "skills are discovered too broadly," #95 is "skills are *installed* too broadly." Together they bound the skill-surface trust problem from both the read and the write axes. Distinct sub-cluster from the permission-audit bundle (#50 / #87 / #91 / #94) and from the truth-audit cluster (#80–#87, #89): this is specifically about *scope asymmetry between install and settings* and the *missing uninstall verb*.
