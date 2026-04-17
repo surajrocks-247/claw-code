@@ -1988,3 +1988,64 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
    **Blocker.** None. Install-scope flag is ~20 lines in `install_skill_into` signature + `handle_skills_slash_command` arg parsing. Uninstall is another ~30 lines mirroring install semantics. `installed_path` exposure is ~5 lines in the JSON builder. Full scope (scoping + uninstall + path surfacing) is ~60 lines + tests.
 
    **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdJ` on main HEAD `b7539e6` in response to Clawhip pinpoint nudge at `1494744278423961742`. Adjacent to #85 (skill discovery ancestor walk) on the *discovery* side — #85 is "skills are discovered too broadly," #95 is "skills are *installed* too broadly." Together they bound the skill-surface trust problem from both the read and the write axes. Distinct sub-cluster from the permission-audit bundle (#50 / #87 / #91 / #94) and from the truth-audit cluster (#80–#87, #89): this is specifically about *scope asymmetry between install and settings* and the *missing uninstall verb*.
+
+96. **`claw --help`'s "Resume-safe commands:" one-liner summary does not filter `STUB_COMMANDS` — 62 documented slash commands that are explicitly marked unimplemented still show up as valid resume-safe entries, contradicting the main Interactive slash commands list just above it (which *does* filter stubs per ROADMAP #39)** — dogfooded 2026-04-18 on main HEAD `8db8e49` from `/tmp/cdK`. The `render_help` output emits two separate enumerations of slash commands; only one of them applies the stub filter. The Resume-safe summary advertises `/budget`, `/rate-limit`, `/metrics`, `/diagnostics`, `/bookmarks`, `/workspace`, `/reasoning`, `/changelog`, `/vim`, `/summary`, `/brief`, `/advisor`, `/stickers`, `/insights`, `/thinkback`, `/keybindings`, `/privacy-settings`, `/output-style`, `/allowed-tools`, `/tool-details`, `/language`, `/max-tokens`, `/temperature`, `/system-prompt` — all of which are explicitly in `STUB_COMMANDS` with "Did you mean" guards and no parse arm.
+
+   **Concrete repro.**
+   ```
+   $ claw --help | head -60 | tail -20     # Interactive slash commands block — correctly filtered
+   $ claw --help | grep 'Resume-safe'       # one-liner summary — leaks stubs
+   Resume-safe commands: /help, /status, /sandbox, /compact, /clear [--confirm], /cost, /config [env|hooks|model|plugins],
+   /mcp [list|show <server>|help], /memory, /init, /diff, /version, /export [file], /agents [list|help],
+   /skills [list|install <path>|help|<skill> [args]], /doctor, /plan [on|off], /tasks [list|get <id>|stop <id>],
+   /theme [theme-name], /vim, /usage, /stats, /copy [last|all], /hooks [list|run <hook>], /files, /context [show|cl
+ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label], /brief, /advisor, /stickers,
+   /insights, /thinkback, /keybindings, /privacy-settings, /output-style [style], /allowed-tools [add|remove|list] [tool],
+   /terminal-setup, /language [language], /max-tokens [count], /temperature [value], /system-prompt,
+   /tool-details <tool-name>, /bookmarks [add|remove|list], /workspace [path], /history [count], /tokens, /cache,
+   /providers, /notifications [on|off|status], /changelog [count], /blame <file> [line], /log [count],
+   /cron [list|add|remove], /team [list|create|delete], /telemetry [on|off|status], /env, /project, /map [depth],
+   /symbols <path>, /hover <symbol>, /diagnostics [path], /alias <name> <command>, /agent [list|spawn|kill],
+   /subagent [list|steer <target> <msg>|kill <id>], /reasoning [on|off|stream], /budget [show|set <limit>],
+   /rate-limit [status|set <rpm>], /metrics
+   ```
+   Programmatic cross-check: intersect the Resume-safe listing with `STUB_COMMANDS` from `rusty-claude-cli/src/main.rs:7240-7320` → 62 entries overlap (most of the tail of the list above). Attempting any of them from a live `/status` prompt returns the stub's "Did you mean" guidance, contradicting the `--help` advertisement.
+
+   **Trace path.**
+    - `rust/crates/rusty-claude-cli/src/main.rs:8268` — main Interactive slash commands block correctly calls `render_slash_command_help_filtered(STUB_COMMANDS)`. This is the block that ROADMAP #39 fixed.
+    - `rust/crates/rusty-claude-cli/src/main.rs:8270-8278` — the Resume-safe commands one-liner is built from `resume_supported_slash_commands()` without any filter argument:
+      ```rust
+      let resume_commands = resume_supported_slash_commands()
+          .into_iter()
+          .map(|spec| match spec.argument_hint {
+              Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
+              None => format!("/{}", spec.name),
+          })
+          .collect::<Vec<_>>()
+          .join(", ");
+      writeln!(out, "Resume-safe commands: {resume_commands}")?;
+      ```
+      `resume_supported_slash_commands()` returns every spec entry with `resume_supported: true`, including the 62 stubs. The block immediately above it passes `STUB_COMMANDS` to the render helper; this block forgot to.
+    - `rust/crates/rusty-claude-cli/src/main.rs:7240-7320` — `STUB_COMMANDS` const lists ~60 slash commands that are explicitly registered in the spec but have no parse arm. Each of those, when invoked, produces the "Unknown slash command: /X — Did you mean /X?" circular error that ROADMAP #39/#54 documented and that the main help block filter was designed to hide.
+
+   **Why this is specifically a clawability gap.**
+    1. *Advertisement contradicts behavior.* The Interactive slash commands block (what operators read when they run `claw --help`) correctly hides stubs. The Resume-safe summary immediately below it re-advertises them. Two sections of the same help output disagree on what exists.
+    2. *ROADMAP #39 is partially regressed.* That filing locked in "hide stub commands from the discovery surfaces that mattered for the original report." Shared help rendering + REPL completions got the filter. The `--help` Resume-safe one-liner was missed. New stubs added to `STUB_COMMANDS` since #39 landed (budget, rate-limit, metrics, diagnostics, workspace, etc.) propagate straight into the Resume-safe listing without any guard.
+    3. *Claws scraping `--help` output to build resume-safe command lists get a 62-item superset of what actually works.* Orchestrators that parse the Resume-safe line to know which slash commands they can safely attempt in resume mode will generate invalid invocations for every stub.
+
+   **Fix shape — one-line change plus regression test.**
+   1. *Apply the same filter used by the Interactive block.* Change `resume_supported_slash_commands()` call at `main.rs:8270` to filter out entries whose name is in `STUB_COMMANDS`:
+      ```rust
+      let resume_commands = resume_supported_slash_commands()
+          .into_iter()
+          .filter(|spec| !STUB_COMMANDS.contains(&spec.name))
+          .map(|spec| ...)
+      ```
+      Or extract a shared helper `resume_supported_slash_commands_filtered(STUB_COMMANDS)` so the two call sites cannot drift again.
+   2. *Regression test.* Add an assertion parallel to `stub_commands_absent_from_repl_completions` that parses the Resume-safe line from `render_help` output and asserts no entry matches `STUB_COMMANDS`. Lock the contract to prevent future regressions.
+
+   **Acceptance.** `claw --help | grep 'Resume-safe'` lists only commands that actually work. Parsing the Resume-safe line and invoking each via `--resume latest /X` produces a valid outcome for every entry (or a documented session-missing error), never a "Did you mean /X" stub guard. The `--help` block stops self-contradicting.
+
+   **Blocker.** None. One-line filter addition plus one regression test. Same pattern as the existing Interactive-block filter.
+
+   **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdK` on main HEAD `8db8e49` in response to Clawhip pinpoint nudge at `1494751832399024178`. A partial regression of ROADMAP #39 / #54 — the filter was applied to the primary slash-command listing and to REPL completions, but the `--help` Resume-safe one-liner was overlooked. New stubs added to `STUB_COMMANDS` since those filings keep propagating to this section. Sibling to #78 (`claw plugins` CLI route wired but never constructed): both are "surface advertises something that doesn't work at runtime" gaps in `--help` / parser coverage. Distinct from the truth-audit / discovery-overreach / reporting-surface clusters — this is a self-contradicting help surface, not a runtime-state or config-hygiene bug.
