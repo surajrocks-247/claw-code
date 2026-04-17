@@ -1276,3 +1276,37 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
    **Blocker.** None. Scope is ~20 lines across `init.rs` (add `to_json_value` + `InitStatus::as_str`) and `main.rs` (switch `run_init` to hold the report and branch on format) plus one regression test.
 
    **Source.** Jobdori dogfood 2026-04-17 against `/tmp/init-test` and `/tmp/claw-clean` on main HEAD `9deaa29` in response to Clawhip pinpoint nudge at `1494608389068558386`. This is the mirror-image of ROADMAP #77 on the success side: the *shape* of success payloads is already structured for 7+ kinds, and `init` is the remaining odd-one-out that leaks structure only through prose.
+
+80. **Session-lookup error copy lies about where claw actually searches for managed sessions — omits the workspace-fingerprint namespacing** — dogfooded 2026-04-17 on main HEAD `688295e` against `/tmp/claw-d4`. Two session error messages advertise `.claw/sessions/` as the managed-session location, but the real on-disk layout (`rust/crates/runtime/src/session_control.rs:32-40` — `SessionStore::from_cwd`) places sessions under `.claw/sessions/<workspace_fingerprint>/` where `workspace_fingerprint()` at line 295-303 is a 16-char FNV-1a hex hash of the absolute CWD path. The gap is user-visible and trivially reproducible.
+
+   **Concrete repro on `/tmp/claw-d4` (fresh `git init` + first `claw ...` invocation auto-creates the hash dir).** After one `claw status` call, the disk layout looks like:
+   ```
+   .claw/sessions/
+   .claw/sessions/90ce0307fff7fef2/    <- workspace fingerprint dir, empty
+   ```
+   Then run `claw --output-format json --resume latest` and the error is:
+   ```
+   {"type":"error","error":"failed to restore session: no managed sessions found in .claw/sessions/\nStart `claw` to create a session, then rerun with `--resume latest`."}
+   ```
+   A claw that dumb-scans `.claw/sessions/` and sees the hash dir has no way to know: (a) what that hash dir is; (b) whether it is the "right" dir for the current workspace; (c) why the session it placed earlier at `.claw/sessions/s1/session.jsonl` is invisible; (d) why a foreign session at `.claw/sessions/ffffffffffffffff/foreign.jsonl` from a previous CWD is also invisible. The error copy as-written is a direct lie — `.claw/sessions/` contained two `.jsonl` files in my repro, and the error still said "no managed sessions found in `.claw/sessions/`".
+
+   **Contrast with the session-not-found error.** `format_missing_session_reference(reference)` at line 516-520 also advertises "managed sessions live in `.claw/sessions/`" — same lie. Both error strings were clearly written before the workspace-fingerprint partitioning shipped and were never updated when it landed; the fingerprint layout is commented in source (`session_control.rs:14-23`) as the intentional design so sessions from different CWDs don't collide, but neither the error messages nor `--help` nor `CLAUDE.md` expose that layout to the operator.
+
+   **Trace path.**
+    - `rust/crates/runtime/src/session_control.rs:32-40` — `SessionStore::from_cwd` computes `sessions_root = cwd.join(".claw").join("sessions").join(workspace_fingerprint(cwd))` and `fs::create_dir_all`s it.
+    - `rust/crates/runtime/src/session_control.rs:295-303` — `workspace_fingerprint()` returns the 16-char FNV-1a hex hash of `workspace_root.to_string_lossy()`.
+    - `rust/crates/runtime/src/session_control.rs:141-148` — `list_sessions()` scans `self.sessions_root` (i.e. the hashed dir) plus an optional legacy root — `.claw/sessions/` itself is never scanned as a flat directory.
+    - `rust/crates/runtime/src/session_control.rs:516-526` — the two `format_*` helpers that build the user-facing error copy hard-code `.claw/sessions/` with no workspace-fingerprint context and no `workspace_root` parameter plumbed in.
+
+   **Fix shape.**
+    - (a) Plumb the resolved `sessions_root` (or `workspace_root` + `workspace_fingerprint`) into the two error formatters so the error copy can point at the actual search path. Example: `no managed sessions found in .claw/sessions/90ce0307fff7fef2/ (workspace=/tmp/claw-d4)\nHint: claw partitions sessions per workspace fingerprint; sessions from other workspaces under .claw/sessions/ are intentionally invisible.\nStart `claw` in this workspace to create a session, then rerun with --resume latest.`
+    - (b) If `list_sessions()` scanned the hashed dir and found nothing but the parent `.claw/sessions/` contains *other* hash dirs with `.jsonl` content, surface that in the hint: "found N session(s) in other workspace partitions; none belong to the current workspace". This mirrors the information the user already sees on disk but never gets in the error.
+    - (c) Add a matching hint to `format_missing_session_reference` so `--resume <nonexistent-id>` also tells the truth about layout.
+    - (d) `CLAUDE.md`/README should document that `.claw/sessions/<hash>/` is intentional partitioning so operators tempted to symlink or merge directories understand why.
+    - (e) Unit coverage parallel to `workspace_fingerprint_is_deterministic_and_differs_per_path` at line 728+ — assert that `list_managed_sessions_for()` error text mentions the actual resolved fingerprint dir, not just `.claw/sessions/`.
+
+   **Acceptance.** A claw dumb-scanning `.claw/sessions/` and seeing non-empty content can tell from the error alone that the sessions belong to other workspace partitions and are intentionally invisible; error text points at the real search directory; and the workspace-fingerprint partitioning stops being surprise state hidden behind a misleading error string.
+
+   **Blocker.** None. Scope is ~30 lines across `session_control.rs:516-526` (re-shape the two helpers to accept the resolved path and optionally enumerate sibling partitions) plus the call sites that invoke them plus one unit test. No runtime behavior change; just error-copy accuracy + optional sibling-partition enumeration.
+
+   **Source.** Jobdori dogfood 2026-04-17 against `/tmp/claw-d4` on main HEAD `688295e` in response to Clawhip pinpoint nudge at `1494615932222439456`. Adjacent to ROADMAP #21 (`/session list` / resumed status contract) but distinct — this is the error-message accuracy gap, not the JSON-shape gap.
