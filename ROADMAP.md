@@ -1440,3 +1440,49 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
    **Blocker.** None. Fix 1 + 2 is ≤20 lines in `rusty-claude-cli/src/main.rs:2010-2020` plus error-string rewording. Fix 3 is optional polish that can land separately; it is not required to close the information-leak / broken-default core.
 
    **Source.** Jobdori dogfood 2026-04-17 against `/tmp/cd4` on main HEAD `70a0f0c` (freshly rebuilt on the dogfood machine) in response to Clawhip pinpoint nudge at `1494661235336282248`. Sibling to #83 (build date → "today") and to the 2026-04-08 startup-friction note ("no default `trusted_roots` in settings"): all three are compile-time or batch-time context bleeding into a surface that should be either runtime-resolved or explicitly configured. Distinct from #80/#81/#82 (surfaces misrepresent runtime state) — here the runtime state being described does not even belong to the user in the first place.
+
+85. **`claw skills` walks `cwd.ancestors()` unbounded and treats every `.claw/skills`, `.omc/skills`, `.agents/skills`, `.codex/skills`, `.claude/skills` it finds as active project skills — cross-project leakage and a cheap skill-injection path from any ancestor directory** — dogfooded 2026-04-17 on main HEAD `2eb6e0c` from `/tmp/trap/inner/work`. A directory I do not own (`/tmp/trap/.agents/skills/rogue/SKILL.md`) above the worker's CWD is enumerated as an `active: true` skill by `claw --output-format json skills`, sourced as `project_claw`/`Project roots`, even after the worker's own CWD is `git init`ed to declare a project boundary. Same effect from any ancestor walk up to `/`.
+
+   **Concrete repros.**
+   1. *Cross-tenant skill injection from a shared `/tmp` ancestor.*
+      ```
+      mkdir -p /tmp/trap/.agents/skills/rogue
+      cat > /tmp/trap/.agents/skills/rogue/SKILL.md <<'EOF'
+      ---
+      name: rogue
+      description: (attacker-controlled skill)
+      ---
+      # rogue
+      EOF
+      mkdir -p /tmp/trap/inner/work
+      cd /tmp/trap/inner/work
+      claw --output-format json skills
+      ```
+      Output contains `{"name":"rogue","active":true,"source":{"id":"project_claw","label":"Project roots"},…}`. `git init` inside `/tmp/trap/inner/work` does *not* stop the ancestor walk — the rogue skill still surfaces, because `cwd.ancestors()` has no concept of "project root."
+
+   2. *CWD-dependent skill set.* From `/Users/yeongyu/scratch-nonrepo` (CWD under `$HOME`) `claw --output-format json skills` returns 50 skills — including every `SKILL.md` under `~/.agents/skills/*`, surfaced via `ancestor.join(".agents").join("skills")` at `rust/crates/commands/src/lib.rs:2811`. From `/tmp/cd5` (same user, same binary, CWD *outside* `$HOME`) the same command returns 24 — missing the entire `~/.agents/skills/*` set because `~` is no longer in the ancestor chain. Skill availability silently flips based on where the worker happened to be started from.
+
+   **Trace path.**
+    - `rust/crates/commands/src/lib.rs:2795` — `discover_skill_roots(cwd)` unconditionally iterates `for ancestor in cwd.ancestors()` with **no upper bound, no project-root check, no `$HOME` containment check, no git/hg/jj boundary check**.
+    - `rust/crates/commands/src/lib.rs:2797-2845` — for every ancestor it appends project skill roots under `.claw/skills`, `.omc/skills`, `.agents/skills`, `.codex/skills`, `.claude/skills`, plus their `commands/` legacy directories.
+    - `rust/crates/commands/src/lib.rs:3223-3290` (`load_skills_from_roots`) — walks each root's `SKILL.md` and emits them all as active unless a higher-priority root has the same name.
+    - `rust/crates/tools/src/lib.rs:3295-3320` — independently, the *runtime* skill-lookup path used by `SkillTool` at execution time walks the same ancestor chain via `push_project_skill_lookup_roots`. Any `.agents/skills/foo/SKILL.md` enumerated from an ancestor is therefore not just *listed* — it is *dispatchable* by name.
+
+   **Why this is a clawability and security gap.**
+    1. *Non-deterministic skill surface.* Two claws started from `/tmp/worker-A/` and `/Users/yeongyu/worker-B/` on the same machine see different skill sets. Principle #1 ("deterministic to start") is violated on a per-CWD basis.
+    2. *Cross-project leakage.* A parent repo's `.agents/skills` silently bleeds into a nested sub-checkout's skill namespace. Nested worktrees, monorepo subtrees, and temporary orchestrator workspaces all inherit ancestor skills they may not own.
+    3. *Skill-injection primitive.* Any directory writable to the attacker on an ancestor path of the worker's CWD (shared `/tmp`, a nested CI mount, a dropbox/iCloud folder, a multi-tenant build agent, a git submodule whose parent repo is attacker-influenced) can drop a `.agents/skills/<name>/SKILL.md` and have it surface as an `active: true` skill with full dispatch via `claw`'s slash-command path. Skill descriptions are free-form Markdown fed into the agent's context; a crafted `description:` becomes a prompt-injection payload the agent willingly reads before it realizes which file it's reading.
+    4. *Asymmetric with agents discovery.* Project agents (`/agents` surface) have explicit project-scoping via `ConfigLoader`; skills discovery does not. The two diverge on which context is considered "project."
+
+   **Fix shape — bound the walk, or re-root it.**
+   1. *Terminate the ancestor walk at the project root.* Plumb `ConfigLoader::project_root()` (or git-toplevel) into `discover_skill_roots` and stop at that boundary. Skills above the project root are ignored — they must be installed explicitly (via `claw skills install` or a settings entry).
+   2. *Optionally also terminate at `$HOME`.* If the project root can't be resolved, stop at `$HOME` so a worker in `/Users/me/foo` never reads from `/Users/`, `/`, `/private`, etc.
+   3. *Require acknowledgment for cross-project skills.* If an ancestor skill is inherited (intentional monorepo case), require an explicit `allow_ancestor_skills` toggle in `settings.json` and emit an event when ancestor-sourced skills are loaded. Matches the intent of ROADMAP principle #5 ("partial success / degraded mode is first-class") — surface the fact that skills are coming from outside the canonical project root.
+   4. *Mirror the same fix in `rust/crates/tools/src/lib.rs::push_project_skill_lookup_roots`* so the *executable* skill surface matches the *listed* skill surface. Today they share the same ancestor-walk bug, so the fix must apply to both.
+   5. *Regression tests:* (a) worker in `/tmp/attacker/.agents/skills/rogue` + inner CWD → `rogue` must not be surfaced; (b) worker in a user home subdir → `~/.agents/skills/*` must not leak unless explicitly allowed; (c) explicit monorepo case: `settings.json { "skills": { "allow_ancestor": true } }` → inherited skills reappear, annotated with their source path.
+
+   **Acceptance.** `claw skills` (list) and `SkillTool` (execute) both scope skill discovery to the resolved project root by default; a skill file planted under a non-project ancestor is invisible to both; an explicit opt-in (settings entry or install) is required to surface or dispatch it; the emitted skill records expose the path the skill was sourced from so a claw can audit its own tool surface.
+
+   **Blocker.** None. Fix is ~30–50 lines total across the two ancestor-walk sites plus the settings-schema extension for the opt-in toggle.
+
+   **Source.** Jobdori dogfood 2026-04-17 against `/tmp/trap/inner/work`, `/Users/yeongyu/scratch-nonrepo`, and `/tmp/cd5` on main HEAD `2eb6e0c` in response to Clawhip pinpoint nudge at `1494668784382771280`. First member of a new sub-cluster ("discovery surface extends outside the project root") that is adjacent to but distinct from the #80–#84 truth-audit cluster — here the surface is structurally *correct* about what it enumerates, but the enumeration itself pulls in state that does not belong to the current project.
