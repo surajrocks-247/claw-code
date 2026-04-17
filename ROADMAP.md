@@ -1230,3 +1230,49 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
    **Blocker.** None. Implementation is bounded to ~15 lines of parser in `main.rs` plus the help/test wiring noted above. Scope matches the same surface that was hardened for `agents` / `mcp` / `skills` already.
 
    **Source.** Jobdori dogfood 2026-04-17 against `/tmp/claw-dogfood-2` on main HEAD `d05c868` in response to Clawhip pinpoint nudge at `1494600832652546151`. Related but distinct from ROADMAP #40/#41 (which harden the *plugin registry report* content + test isolation) and ROADMAP #39 (stub slash-command surface hiding); this is the non-interactive CLI entrypoint contract.
+
+79. **`claw --output-format json init` discards an already-structured `InitReport` and ships only the rendered prose as `message`** — dogfooded 2026-04-17 on main HEAD `9deaa29`. The init pipeline in `rust/crates/rusty-claude-cli/src/init.rs:38-113` already produces a fully-typed `InitReport { project_root: PathBuf, artifacts: Vec<InitArtifact { name: &'static str, status: InitStatus }> }` where `InitStatus` is the enum `{ Created, Updated, Skipped }` (line 15-20). `run_init()` at `rust/crates/rusty-claude-cli/src/main.rs:5436-5446` then funnels that structured report through `init_claude_md()` which calls `.render()` and throws away the structure, and `init_json_value()` at 5448-5454 wraps *only* the prose string into `{"kind":"init","message":"<Init\n  Project ...\n  .claw/ created\n  .claw.json created\n  .gitignore created\n  CLAUDE.md created\n  Next step ..."}`. Concrete repros on a clean `/tmp/init-test` (fresh `git init`):
+    - First `claw --output-format json init` → all artifacts `created`, payload has only `kind`+`message` with the 4 per-artifact states baked into the prose.
+    - Second `claw --output-format json init` → all artifacts `skipped (already exists)`, payload shape unchanged.
+    - `rm CLAUDE.md` + third `init` → `.claw/`/`.claw.json`/`.gitignore` `skipped`, `CLAUDE.md` `created`, payload shape unchanged.
+   In all three cases the downstream consumer has to regex the message string to distinguish `created` / `updated` / `skipped` per artifact. A CI/automation claw that wants to assert "`.gitignore` was freshly updated this run" cannot do it without text-scraping.
+
+   **Contrast with other success payloads on the same binary.**
+    - `claw --output-format json version` → `{kind, message, version, git_sha, target, build_date}` — structured.
+    - `claw --output-format json system-prompt` → `{kind, message, sections}` — structured.
+    - `claw --output-format json acp` → `{kind, message, aliases, status, supported, launch_command, serve_alias_only, tracking, discoverability_tracking, recommended_workflows}` — fully structured.
+    - `claw --output-format json bootstrap-plan` → `{kind, phases}` — structured.
+    - `claw --output-format json init` → `{kind, message}` only. **Sole odd one out.**
+
+   **Trace path.**
+    - `rust/crates/rusty-claude-cli/src/init.rs:14-20` — `InitStatus::{Created, Updated, Skipped}` enum with a `label()` helper already feeding the render layer.
+    - `rust/crates/rusty-claude-cli/src/init.rs:33-36` — `InitArtifact { name, status }` already structured.
+    - `rust/crates/rusty-claude-cli/src/init.rs:38-41,80-113` — `InitReport { project_root, artifacts }` fully structured at point of construction.
+    - `rust/crates/rusty-claude-cli/src/main.rs:5431-5434` — `init_claude_md()` calls `.render()` on the `InitReport` and **discards the structure**, returning `Result<String, _>`.
+    - `rust/crates/rusty-claude-cli/src/main.rs:5448-5454` — `init_json_value(message)` accepts only the rendered string and emits `{"kind": "init", "message": message}` with no access to the original report.
+
+   **Fix shape.**
+    - (a) Thread the `InitReport` (not just its rendered string) into the JSON serializer. Either (i) change `run_init` to hold the `InitReport` and call `.render()` only for the `CliOutputFormat::Text` branch while the JSON branch gets the structured report, or (ii) introduce an `InitReport::to_json_value(&self) -> serde_json::Value` method and call it from `init_json_value`.
+    - (b) Emit per-artifact structured state under a new field, preserving `message` for backward compatibility (parallel to how `system-prompt` keeps `message` alongside `sections`):
+      ```json
+      {
+        "kind": "init",
+        "message": "Init\n  Project ...\n  .claw/ created\n  ...",
+        "project_root": "/private/tmp/init-test",
+        "artifacts": [
+          {"name": ".claw/",      "status": "created"},
+          {"name": ".claw.json",  "status": "created"},
+          {"name": ".gitignore",  "status": "updated"},
+          {"name": "CLAUDE.md",   "status": "skipped"}
+        ]
+      }
+      ```
+    - (c) `InitStatus` should serialize to its snake_case variant (`created`/`updated`/`skipped`) via either a `Display` impl or an explicit `as_str()` helper paralleling the existing `label()`, so the JSON value is the short machine-readable token (not the human label `skipped (already exists)`).
+    - (d) Add a regression test parallel to `crates/rusty-claude-cli/tests/output_format_contract.rs::doctor_and_resume_status_emit_json_when_requested` — spin up a tempdir, run `init` twice, assert the second invocation returns `artifacts[*].status == "skipped"` and the first returns `"created"`/`"updated"` as appropriate.
+    - (e) Low-risk: `message` stays, so any consumer still reading only `message` keeps working.
+
+   **Acceptance.** Downstream automation can programmatically detect partial-initialization scenarios (e.g. CI lane that regenerates `CLAUDE.md` each time but wants to preserve a hand-edited `.claw.json`) without regex-scraping prose; the `init` payload joins `version` / `acp` / `bootstrap-plan` / `system-prompt` in the "structured success" group; and the already-typed `InitReport` stops being thrown away at the JSON boundary.
+
+   **Blocker.** None. Scope is ~20 lines across `init.rs` (add `to_json_value` + `InitStatus::as_str`) and `main.rs` (switch `run_init` to hold the report and branch on format) plus one regression test.
+
+   **Source.** Jobdori dogfood 2026-04-17 against `/tmp/init-test` and `/tmp/claw-clean` on main HEAD `9deaa29` in response to Clawhip pinpoint nudge at `1494608389068558386`. This is the mirror-image of ROADMAP #77 on the success side: the *shape* of success payloads is already structured for 7+ kinds, and `init` is the remaining odd-one-out that leaks structure only through prose.
