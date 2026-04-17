@@ -1486,3 +1486,45 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
    **Blocker.** None. Fix is ~30–50 lines total across the two ancestor-walk sites plus the settings-schema extension for the opt-in toggle.
 
    **Source.** Jobdori dogfood 2026-04-17 against `/tmp/trap/inner/work`, `/Users/yeongyu/scratch-nonrepo`, and `/tmp/cd5` on main HEAD `2eb6e0c` in response to Clawhip pinpoint nudge at `1494668784382771280`. First member of a new sub-cluster ("discovery surface extends outside the project root") that is adjacent to but distinct from the #80–#84 truth-audit cluster — here the surface is structurally *correct* about what it enumerates, but the enumeration itself pulls in state that does not belong to the current project.
+
+86. **`.claw.json` with invalid JSON is silently discarded and `claw doctor` still reports `Config: ok — runtime config loaded successfully`** — dogfooded 2026-04-17 on main HEAD `586a92b` against `/tmp/cd7`. A user's own legacy config file is parsed, fails, gets dropped on the floor, and every diagnostic surface claims success. Permissions revert to defaults, MCP servers go missing, provider fallbacks stop applying — without a single signal that the operator's config never made it into `RuntimeConfig`.
+
+   **Concrete repro.**
+   ```
+   mkdir -p /tmp/cd7 && cd /tmp/cd7 && git init -q
+   echo '{"permissions": {"defaultMode": "plan"}}' > .claw.json
+   claw status | grep Permission    # -> Permission mode  read-only   (plan applied)
+
+   echo 'this is { not } valid json at all' > .claw.json
+   claw status | grep Permission    # -> Permission mode  danger-full-access   (default; config silently dropped)
+   claw --output-format json doctor | jq '.checks[] | select(.name=="config")'
+   #   { "status": "ok",
+   #     "summary": "runtime config loaded successfully",
+   #     "loaded_config_files": 0,
+   #     "discovered_files_count": 1,
+   #     "discovered_files": ["/private/tmp/cd7/.claw.json"],
+   #     ... }
+   ```
+   Compare with a non-legacy config path at the same level of corruption: `echo 'this is { not } valid json at all' > .claw/settings.json` produces `Config: fail — runtime config failed to load: … invalid literal: expected true`. Same file contents, different filename → opposite diagnostic verdict.
+
+   **Trace path — where the silent drop happens.**
+    - `rust/crates/runtime/src/config.rs:674-692` — `read_optional_json_object(path)` sets `is_legacy_config = (file_name == ".claw.json")`. If JSON parsing fails *and* `is_legacy_config` is true, the match arm at line 690 returns `Ok(None)` instead of `Err(ConfigError::Parse(…))`. Same swallow on line 695-697 when the top-level value isn't a JSON object. No warning printed, no `eprintln!`, no entry added to `loaded_entries`.
+    - `rust/crates/runtime/src/config.rs:277-287` — `ConfigLoader::load()` just `continue`s past the `None` result, so the file is counted by `discover()` but produces no entry in the loaded set.
+    - `rust/crates/rusty-claude-cli/src/main.rs:1725-1754` — the `Config` doctor check reads `loaded_count = loaded_entries.len()` and `present_count = present_paths.len()`, computes a detail line `Config files      loaded {loaded}/{present}`, and then *still* emits `DiagnosticLevel::Ok` with the summary `"runtime config loaded successfully"` as long as `load()` returned `Ok(_)`. `loaded 0/1` paired with `ok / loaded successfully` is a direct contradiction the surface happily renders.
+
+   **Intent vs effect.** The `is_legacy_config` swallow was presumably added so that a historical `.claw.json` left behind by an older version wouldn't brick startup on a fresh run. That's a reasonable intent. The implementation is wrong in two ways:
+    1. The user's *current* `.claw.json` is now indistinguishable from a historical stale `.claw.json` — any typo silently wipes out their permissions/MCP/aliases config on the next invocation.
+    2. No signal is emitted. A claw reading `claw --output-format json doctor` sees `config ok`, reports "config is fine," and proceeds to run with wrong permissions/missing MCP. This is exactly the "surface lies about runtime truth" shape from the #80–#84 cluster, at the config layer.
+
+   **Why this is specifically a clawability gap.** Principle #2 ("Truth is split across layers") and Principle #3 ("Events over scraped prose") both presume the diagnostic surface is trustworthy. A claw that trusts `config: ok` and proceeds to spawn a worker with `permissions.defaultMode = "plan"` configured in `.claw.json` will get `danger-full-access` silently if the file has a trailing comma. A clawhip `preflight` that runs `claw doctor` and only escalates to the human on `status != "ok"` will never see this. A batch orchestrator running 20 lanes with a typo in the shared `.claw.json` will run 20 lanes with wrong permissions and zero diagnostics.
+
+   **Fix shape — three small pieces.**
+   1. *Replace the silent skip with a loud warn-and-skip.* In `read_optional_json_object` at `config.rs:690` and `:695`, instead of `return Ok(None)` on parse failure for `.claw.json`, return `Ok(Some(ParsedConfigFile::empty_with_warning(…)))` (or similar) with the parse error captured as a structured warning. Plumb that warning into `ConfigLoader::load()` alongside the existing `all_warnings` collection so it surfaces on stderr and in `doctor`'s detail block.
+   2. *Flip the doctor verdict when `loaded_count < present_count`.* In `rusty-claude-cli/src/main.rs:1747-1755`, when `present_count > 0 && loaded_count < present_count`, emit `DiagnosticLevel::Warn` (or `Fail` when *all* discovered files fail to load) with a summary like `"loaded N/{present_count} config files; {present_count - N} skipped due to parse errors"`. Add a structured field `skipped_files` / `skip_reasons` to the JSON surface so clawhip can branch on it.
+   3. *Regression tests:* (a) corrupt `.claw.json` → `doctor` emits `warn` with a skipped-files detail; (b) corrupt `.claw.json` → `status` shows a `config_skipped: 1` marker; (c) `loaded_entries.len()` equals zero while `discover()` returns one → never `DiagnosticLevel::Ok`.
+
+   **Acceptance.** After a user writes a `.claw.json` with a typo, `claw status` / `claw doctor` clearly show that the config failed to load and name the parse error. A claw reading the JSON `doctor` surface can distinguish "config is healthy" from "config was present but not applied." The legacy-compat swallow is preserved *only* in the sense that startup does not hard-fail — the signal still reaches the operator.
+
+   **Blocker.** None. Fix is ~20–30 lines in two files (`runtime/src/config.rs` + `rusty-claude-cli/src/main.rs`) plus three regression tests.
+
+   **Source.** Jobdori dogfood 2026-04-17 against `/tmp/cd7` on main HEAD `586a92b` in response to Clawhip pinpoint nudge at `1494676332507041872`. Sibling to #80–#84 (surface lies about runtime truth): here the surface is the config-health diagnostic, and the lie is a legacy-compat swallow that was meant to tolerate historical `.claw.json` files but now masks live user-written typos. Distinct from #85 (discovery-overreach) — that one is the discovery *path* reaching too far; this one is the *load* path silently dropping a file that is clearly in scope.
