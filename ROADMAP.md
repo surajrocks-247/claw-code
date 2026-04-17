@@ -2614,3 +2614,96 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. Three-source agent discovery (`.toml`, `.md`, shared helpers) is ~30 lines. Content validation using existing tool-registry + model-alias machinery is ~40 lines. Doctor check is ~25 lines. All additive; no breaking changes for existing `.toml`-only configs.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdX` on main HEAD `6a16f08` in response to Clawhip pinpoint nudge at `1494804679962661187`. Joins **truth-audit / diagnostic-integrity** (#80-#84, #86, #87, #89, #100, #102) on the agent-discovery axis: another "subsystem silently reports ok while ignoring operator input." Joins **silent-flag / documented-but-unenforced** (#96-#101) on the silent-discard dimension (but subsystem-scale rather than flag-scale). Joins **unplumbed-subsystem** (#78, #96, #100, #102) as the fifth surface with machinery present but operator-unreachable: `load_agents_from_roots` exists, `parse_skill_frontmatter` exists (used for skills), validation helpers exist (used for `--allowedTools`) — the agents path just doesn't call any of them beyond TOML parsing. Natural bundle: **#102 + #103** (subsystem-doctor-coverage 2-way — MCP liveness + agent-format validity); also **#78 + #96 + #100 + #102 + #103** as the unplumbed-surface quintet. And cross-cluster with **Claude Code migration parity** (no other ROADMAP entry captures this yet) — claw-code silently breaks an expected migration path for a first-class subsystem.
+
+104. **`/export <path>` (slash command) and `claw export <path>` (CLI) are two different code paths with incompatible filename semantics: the slash path silently appends `.txt` to any non-`.txt` filename (`/export foo.md` → `foo.md.txt`, `/export report.json` → `report.json.txt`), and neither path does any path-traversal validation so a relative path like `../../../tmp/pwn.md` resolves to the computed absolute path outside the project root. The slash path's rendered content is full Markdown (`# Conversation Export`, `- **Session**: ...`, fenced code blocks) but the forced `.txt` extension misrepresents the file type. Meanwhile `/export`'s `--help` documentation string is just `/export [file]` — no mention of the forced-`.txt` behavior, no mention of the path-resolution semantics** — dogfooded 2026-04-18 on main HEAD `7447232` from `/tmp/cdY`. A claw orchestrating session transcripts via the slash command and expecting `.md` output gets a `.md.txt` file it cannot find with a glob for `*.md`. A claw writing session exports under a trusted output directory gets silently path-traversed outside it when the caller's filename input contains `../` segments.
+
+     **Concrete repro.**
+     ```
+     $ cd /tmp/cdY && git init -q .
+     $ mkdir -p .claw/sessions/dummy
+     $ cat > .claw/sessions/dummy/session.jsonl << 'JSONL'
+     {"type":"session_meta","version":1,"session_id":"dummy","created_at_ms":1700000000000,"updated_at_ms":1700000000000}
+     {"type":"message","message":{"role":"user","blocks":[{"type":"text","text":"hi"}]}}
+     {"type":"message","message":{"role":"assistant","blocks":[{"type":"text","text":"hello"}]}}
+     JSONL
+
+     # Case A: slash /export with .md extension → .md.txt written, reported as "File" being the rewritten path
+     $ claw --resume $(pwd)/.claw/sessions/dummy/session.jsonl /export /tmp/export.md
+     Export
+       Result           wrote transcript
+       File             /tmp/export.md.txt
+       Messages         2
+     $ ls /tmp/export.md*
+     /tmp/export.md.txt
+     # User asked for .md. Got .md.txt. Silently.
+
+     # Case B: slash /export with ../ path → resolves outside cwd; no path-traversal rejection
+     $ claw --resume $(pwd)/.claw/sessions/dummy/session.jsonl /export "../../../tmp/pwn.md"
+     Export
+       Result           wrote transcript
+       File             /private/tmp/cdY/../../../tmp/pwn.md.txt
+       Messages         2
+     $ ls /tmp/pwn.md.txt
+     /tmp/pwn.md.txt
+     # Relative path resolved outside /tmp/cdY project root. .txt still appended.
+
+     # Case C: CLI claw export (separate code path) — no .txt suffix munging, uses fs::write directly
+     $ claw export <session-ref> /tmp/cli-export.md
+     # Writes /tmp/cli-export.md verbatim, no suffix. No path-traversal rejection either.
+
+     # Help documentation: no warning about any of this
+     $ claw --help | grep -A1 "/export"
+       /export [file]                 Export the current conversation to a file [resume]
+     # No mention of forced .txt suffix. No mention of path semantics.
+     ```
+
+     **Trace path.**
+     - `rust/crates/rusty-claude-cli/src/main.rs:5990-6010` — `resolve_export_path` (used by `/export` slash command):
+       ```rust
+       fn resolve_export_path(requested_path: Option<&str>, session: &Session) -> Result<PathBuf, Box<dyn std::error::Error>> {
+           let cwd = env::current_dir()?;
+           let file_name = requested_path.map_or_else(|| default_export_filename(session), ToOwned::to_owned);
+           let final_name = if Path::new(&file_name).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("txt")) {
+               file_name
+           } else {
+               format!("{file_name}.txt")
+           };
+           Ok(cwd.join(final_name))
+       }
+       ```
+       Branch 1: if extension is `.txt`, keep filename as-is. Branch 2: otherwise, append `.txt`. No consideration of `.md`, `.markdown`, `.html`, or any extension that matches the content type actually written. `cwd.join(final_name)` with an absolute `final_name` yields the absolute path; with a relative `final_name` containing `../`, yields a resolved path outside cwd.
+     - `rust/crates/rusty-claude-cli/src/main.rs:6021-6055` — `run_export` (used by `claw export` CLI):
+       ```rust
+       fn run_export(session_reference: &str, output_path: Option<&Path>, ...) {
+           // ... loads session, renders markdown ...
+           if let Some(path) = output_path {
+               fs::write(path, &markdown)?;
+               // ... emits report with path.display() ...
+           }
+       }
+       ```
+       **No suffix munging. No path-traversal check.** Just `fs::write(path, &markdown)` directly. Two parallel code paths for "export session transcript" with non-equivalent semantics.
+     - Content rendering via `render_session_markdown` at `main.rs:6075` produces Markdown output (`# Conversation Export`, `- **Session**: ...`, `## 1. User`, fenced ``` blocks for code). The forced `.txt` extension misrepresents the file type: content is Markdown, extension says plain text. A claw pipeline that routes files by extension (e.g. "Markdown goes to archive, text goes to logs") will misroute every slash-command export.
+     - `--help` at `main.rs:8307` and the slash-command registry list `/export [file]` with no format-forcing or path-semantics note. The `--help` example line `claw --resume latest /status /diff /export notes.txt` implicitly advertises `.txt` usage without explaining what happens if you pass anything else.
+     - `default_export_filename` at `main.rs:5975-5988` builds a fallback name from session metadata and hardcodes `.txt` — consistent with the suffix-forcing behavior, but also hardcoded to "text" when content is actually Markdown.
+
+     **Why this is specifically a clawability gap.**
+     1. *Surprise suffix rewrite.* A claw that runs `/export foo.md` and then tries to glob `*.md` to pick up the transcript gets nothing — the file is at `foo.md.txt`. A developer-facing user does not expect `.md` → `.md.txt`. No warning, no `--force-txt-extension` flag, no way to opt out.
+     2. *Content type mismatch.* The rendered content is Markdown (explicitly — look at the function name and the generated headings). Saving Markdown content with a `.txt` extension is technically wrong: every editor/viewer/pipeline that routes files by extension (preview, syntax highlight, archival policy) will misclassify it.
+     3. *Two parallel paths, non-equivalent semantics.* `/export` applies the suffix; `claw export` does not. A claw that uses one form and then switches to the other (reasonable — both are documented as export surfaces) sees different output-file names for the same input. Same command category, incompatible output contracts.
+     4. *No path-traversal validation on either path.* `cwd.join(relative_with_dotdot)` resolves to a computed path outside cwd. `fs::write(absolute_path, ...)` writes wherever the caller asked. If the slash command's `file` argument comes from an LLM-generated prompt (likely, for dynamic archival of session transcripts), the LLM can direct writes to arbitrary filesystem locations within the process's permission scope.
+     5. *Undocumented behavior.* `/export [file]` in help says nothing about suffix forcing or path semantics. An operator has no surface-level way to learn the contract without reading source.
+     6. *Joins the silent-rewrite class.* #96 leaks stub commands; #97 silently empties allow-set; #98 silently ignores `--compact`; #99 unvalidated input injection; #101 env-var fail-open; **#104 silently rewrites operator-supplied filenames** and never warns that two parallel export paths disagree.
+
+     **Fix shape — make the two export paths equivalent; preserve operator-supplied filenames; validate path semantics.**
+     1. *Unify export via a single helper.* Both `/export` and `claw export` should call a shared `export_session_to_path(session, path, ...)` function. Slash and CLI paths currently duplicate logic; extract. ~40 lines.
+     2. *Respect the caller's filename extension.* If the caller supplied `.md`, write as `.md`. If `.html`, write `.html`. Pick the content renderer based on extension (Markdown renderer for `.md`/`.markdown`, plain renderer for `.txt`, HTML renderer for `.html`) or just accept that the content is Markdown and name the file accordingly. ~15 lines.
+     3. *Path-traversal policy.* Decide whether exports are restricted to the project root, the user home, or unrestricted-with-warning. If restricted: reject paths that resolve outside the chosen root with `Err("export path <path> resolves outside <root>; pass an absolute path under <root> or use --allow-broad-output")`. If unrestricted: at minimum, emit a warning when the resolved path is outside cwd. ~20 lines.
+     4. *Help documentation.* Update `/export [file]` help entry to say "writes the rendered Markdown transcript to `<file>`; extension is preserved" and "relative paths are resolved against the current working directory." ~5 lines.
+     5. *Regression tests.* One per extension (`.md`, `.txt`, `.html`, no-ext) for both paths. One for relative-path-with-dotdot rejection (or allow-with-warning). One for equality between slash and CLI output files given the same input.
+
+     **Acceptance.** `claw --resume <ref> /export foo.md` writes `foo.md` (not `foo.md.txt`). `claw --resume <ref> /export foo.txt` writes `foo.txt`. `claw --resume <ref> /export ../../../pwn.md` either errors with a path-traversal rejection or writes to the computed path with a structured warning — no silent escape. Same behavior for `claw export`. `--help` documents the contract.
+
+     **Blocker.** None. Unification + extension-preservation is ~50 lines. Path-traversal policy is ~20 lines + an architectural decision on whether to restrict. All additive, backward-compatible if the "append `.txt` if extension isn't `.txt`" logic is replaced with "pass through whatever the caller asked for."
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdY` on main HEAD `7447232` in response to Clawhip pinpoint nudge at `1494812230372294849`. Joins the **silent-flag / documented-but-unenforced** cluster (#96-#101) on the filename-rewrite dimension: documented interface is `/export [file]`, actual behavior silently rewrites the file extension. Joins the **two-paths-diverge** sub-cluster with the permission-mode parser disagreement (#91) and CLI↔env surface mismatch (#101): different input surfaces for the same logical action with non-equivalent semantics. Natural bundle: **#91 + #101 + #104** — three instances of the same meta-pattern (parallel entry points to the same subsystem that do subtly different things). Also **#96 + #98 + #99 + #101 + #104** as the full silent-rewrite-or-silent-noop quintet.
