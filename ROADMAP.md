@@ -2348,3 +2348,106 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. Four additive JSON field groups (~80 lines total) plus one-flag-plumbing change and one three-line parser fix. The underlying stale-base subsystem and git helpers are all already implemented — this is strictly plumbing + surfacing.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdU` + `/tmp/cdO*` scratch repos on main HEAD `63a0d30` in response to Clawhip pinpoint nudge at `1494782026660712672`. Cross-cluster find: primary cluster is **truth-audit / diagnostic-integrity** (joins #80–#87, #89) — the status/doctor JSON lies by omission about the git state it claims to report. Secondary cluster is **silent-flag / documented-but-unenforced** (joins #96, #97, #98, #99) — the `--base-commit` flag is a silent no-op on status/doctor. Tertiary cluster is **unplumbed-subsystem** — `runtime::stale_base` is fully implemented but only reachable via stderr in the Prompt/Repl paths; this is the same shape as the `claw plugins` CLI route being wired but never constructed (#78). Natural bundle candidates: **#89 + #100** (git-state completeness sweep — #89 adds mid-operation states, #100 adds commit identity + stale-base + upstream); **#78 + #96 + #100** (unplumbed-surface triangle — CLI route never wired, help-listing unfiltered, subsystem present but JSON-invisible). Hits the roadmap's own Product Principle #4 and Phase 2 §4.2 directly — making this pinpoint the most load-bearing of the 20 items filed this dogfood session for the "branch freshness" product thesis. Milestone: ROADMAP #100.
+
+101. **`RUSTY_CLAUDE_PERMISSION_MODE` env var silently swallows any invalid value — including common typos and valid-config-file aliases — and falls through to the ultimate default `danger-full-access`. A lane that sets `export RUSTY_CLAUDE_PERMISSION_MODE=readonly` (missing hyphen), `read_only` (underscore), `READ-ONLY` (case), `dontAsk` (config-file alias not recognized at env-var path), or any garbage string gets the LEAST safe mode silently, while `--permission-mode readonly` loudly errors. The env var itself is also undocumented — not referenced in `--help`, README, or any docs — an undocumented knob with fail-open semantics** — dogfooded 2026-04-18 on main HEAD `d63d58f` from `/tmp/cdV`. Matrix of tested values: `"read-only"` / `"workspace-write"` / `"danger-full-access"` / `" read-only "` all work. `""` / `"garbage"` / `"redonly"` / `"readonly"` / `"read_only"` / `"READ-ONLY"` / `"ReadOnly"` / `"dontAsk"` / `"readonly\n"` all silently resolve to `danger-full-access`.
+
+     **Concrete repro.**
+     ```
+     $ RUSTY_CLAUDE_PERMISSION_MODE="readonly" claw --output-format json status | jq '.permission_mode'
+     "danger-full-access"
+     # typo 'readonly' (missing hyphen) — silent fallback to most permissive mode
+
+     $ RUSTY_CLAUDE_PERMISSION_MODE="read_only" claw --output-format json status | jq '.permission_mode'
+     "danger-full-access"
+     # underscore variant — silent fallback
+
+     $ RUSTY_CLAUDE_PERMISSION_MODE="READ-ONLY" claw --output-format json status | jq '.permission_mode'
+     "danger-full-access"
+     # case-sensitive — silent fallback
+
+     $ RUSTY_CLAUDE_PERMISSION_MODE="dontAsk" claw --output-format json status | jq '.permission_mode'
+     "danger-full-access"
+     # config-file alias dontAsk accidentally "works" because the ultimate default is ALSO danger-full-access
+     # — but via the wrong path (fallback, not alias resolution); indistinguishable from typos
+
+     $ RUSTY_CLAUDE_PERMISSION_MODE="garbage" claw --output-format json status | jq '.permission_mode'
+     "danger-full-access"
+     # pure garbage — silent fallback; operator never learns their env var was invalid
+
+     # Compare to CLI flag — loud structured error for the exact same invalid value
+     $ claw --permission-mode readonly --output-format json status
+     {"error":"unsupported permission mode 'readonly'. Use read-only, workspace-write, or danger-full-access.","type":"error"}
+
+     # Env var is undocumented in --help
+     $ claw --help | grep -i RUSTY_CLAUDE
+     (empty)
+     # No mention of RUSTY_CLAUDE_PERMISSION_MODE anywhere in the user-visible surface
+     ```
+
+     **Trace path.**
+     - `rust/crates/rusty-claude-cli/src/main.rs:1099-1107` — `default_permission_mode`:
+       ```rust
+       fn default_permission_mode() -> PermissionMode {
+           env::var("RUSTY_CLAUDE_PERMISSION_MODE")
+               .ok()
+               .as_deref()
+               .and_then(normalize_permission_mode)     // returns None on invalid
+               .map(permission_mode_from_label)
+               .or_else(config_permission_mode_for_current_dir)  // fallback
+               .unwrap_or(PermissionMode::DangerFullAccess)      // ultimate fail-OPEN default
+       }
+       ```
+       `.and_then(normalize_permission_mode)` drops the error context: an invalid env value becomes `None`, falls through to config, falls through to `DangerFullAccess`. No warning emitted, no log line, no doctor check surfaces it.
+     - `rust/crates/rusty-claude-cli/src/main.rs:5455-5462` — `normalize_permission_mode` accepts only three canonical strings:
+       ```rust
+       fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
+           match mode.trim() {
+               "read-only" => Some("read-only"),
+               "workspace-write" => Some("workspace-write"),
+               "danger-full-access" => Some("danger-full-access"),
+               _ => None,
+           }
+       }
+       ```
+       No typo tolerance. No case-insensitive match. No support for the config-file aliases (`default`, `plan`, `acceptEdits`, `auto`, `dontAsk`) that `parse_permission_mode_label` in `runtime/src/config.rs:855-863` accepts. Two parsers, different accepted sets, no shared source of truth.
+     - `rust/crates/runtime/src/config.rs:855-863` — `parse_permission_mode_label` accepts 7 aliases (`default` / `plan` / `read-only` / `acceptEdits` / `auto` / `workspace-write` / `dontAsk` / `danger-full-access`) and returns a structured `Err(ConfigError::Parse(...))` on unknown values — the config path is loud. Env path is silent.
+     - `rust/crates/rusty-claude-cli/src/main.rs:1095` — `permission_mode_from_label` panics on an unknown label with `unsupported permission mode label`. This panic path is unreachable from the env-var flow because `normalize_permission_mode` filters first. But the panic message itself proves the code knows these strings are not interchangeable — the env flow just does not surface that.
+     - Documentation search: `grep -rn RUSTY_CLAUDE_PERMISSION_MODE` in README / docs / `--help` output returns zero hits. The env var is internal plumbing with no operator-facing surface.
+
+     **Why this is specifically a clawability gap.**
+     1. *Fail-OPEN to the least safe mode.* An operator whose intent is "restrict this lane to read-only" typos the env var and gets `danger-full-access`. The failure mode lets a lane have *more* permission than requested, not less. Every other silent-no-op finding in the #96–#100 cluster fails closed (flag does nothing) or fails inert (no effect). This one fails *open* — the operator's safety intent is silently downgraded to the most permissive setting. Qualitatively more severe than #97 / #98 / #100.
+     2. *CLI vs env asymmetry.* `--permission-mode readonly` errors loudly. `RUSTY_CLAUDE_PERMISSION_MODE=readonly` silently degrades to `danger-full-access`. Same input, same misspelling, opposite outcomes. Operators who moved their permission setting from CLI flag to env var (reasonable practice — flags are per-invocation, env vars are per-shell) will land on the silent-degrade path.
+     3. *Undocumented knob.* The env var is not mentioned in `--help`, not in README, not anywhere user-facing. Reference-check via grep returns only source hits. An undocumented internal knob is bad enough; an undocumented internal knob with fail-open semantics compounds the severity because operators who discover it (by reading source or via leakage) are exactly the population least likely to have it reviewed or audited.
+     4. *Parser asymmetry with config.* Config accepts `dontAsk` / `plan` / `default` / `acceptEdits` / `auto` (per #91). Env var accepts none of those. Operators migrating config → env or env → config hit silent degradation in both directions when an alias is involved. #91 captured the config↔CLI axis; this captures the config↔env axis and the CLI↔env axis, completing the triangle.
+     5. *"dontAsk" via env accidentally works for the wrong reason.* `RUSTY_CLAUDE_PERMISSION_MODE=dontAsk` resolves to `danger-full-access` not because the env parser understands the alias, but because `normalize_permission_mode` rejects it (returns None), falls through to config (also None in a fresh workspace), and lands on the fail-open ultimate default. The correct mapping and the typo mapping produce the same observable result, making debugging impossible — an operator testing their env config has no way to tell whether the alias was recognized or whether they fell through to the unsafe default.
+     6. *Joins the permission-audit sweep on a new axis.* #50 / #87 / #91 / #94 / #97 cover permission-mode defaults, CLI↔config parser disagreement, tool-allow-list, and rule validation. #101 covers the env-var input path — the third and final input surface for permission mode. Completes the three-way input-surface audit (CLI / config / env).
+
+     **Fix shape — reject invalid env values loudly; share a single permission-mode parser across all three input surfaces; document the knob.**
+     1. *Rewrite `default_permission_mode` to surface invalid env values.* Change the `.and_then(normalize_permission_mode)` pattern to match on the env read result and return a `Result` that the caller displays. Something like:
+        ```rust
+        fn default_permission_mode() -> Result<PermissionMode, String> {
+            if let Some(env_value) = env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok() {
+                let trimmed = env_value.trim();
+                if !trimmed.is_empty() {
+                    return normalize_permission_mode(trimmed)
+                        .map(permission_mode_from_label)
+                        .ok_or_else(|| format!(
+                            "RUSTY_CLAUDE_PERMISSION_MODE has unsupported value '{env_value}'. Use read-only, workspace-write, or danger-full-access."
+                        ));
+                }
+            }
+            Ok(config_permission_mode_for_current_dir().unwrap_or(PermissionMode::DangerFullAccess))
+        }
+        ```
+        Callers propagate the error the same way `--permission-mode` rejection propagates today. ~15 lines in `default_permission_mode` plus ~5 lines at each caller to unwrap the Result. Alternative: emit a warning to stderr and still fall back to a safe (not fail-open) default like `read-only` — but that trades operator surprise for safer default; architectural choice.
+     2. *Share one parser across CLI / config / env.* Extract `parse_permission_mode_label` from `runtime/src/config.rs:855` into a shared helper used by all three input surfaces. Decide on a canonical accepted set: either the broad 7-alias set (preserves back-compat with existing configs that use `dontAsk` / `plan` / `default` / etc.) or the narrow 3-canonical set (cleaner but breaks existing configs). Pick one; enforce everywhere. Closes the parser-disagreement axis that #91 flagged on the config↔CLI boundary; this PR extends it to the env boundary. ~30 lines.
+     3. *Document the env var.* Add `RUSTY_CLAUDE_PERMISSION_MODE` to `claw --help` "Environment variables" section (if one exists — add it if not). Reference it in README permission-mode section. ~10 lines across help string and docs.
+     4. *Rename the env var (optional).* `RUSTY_CLAUDE_PERMISSION_MODE` predates the `claw` / claw-code rename. A forward-looking fix would add `CLAW_PERMISSION_MODE` as the canonical name with `RUSTY_CLAUDE_PERMISSION_MODE` kept as a deprecated alias with a one-time stderr warning. ~15 lines; not strictly required for this bug but natural alongside the audit.
+     5. *Regression tests.* One per rejected env value. One per valid env value (idempotence). One for the env+config interaction (env takes precedence over config). One for the "dontAsk" in env case (should error, not fall through silently).
+     6. *Add a doctor check.* `claw doctor` should surface `permission_mode: {source: "flag"|"env"|"config"|"default", value: "<mode>"}` so an operator can verify the resolved mode matches their intent. Complements #97's proposed `allowed_tools` surface in status JSON and #100's `base_commit` surface; together they add visibility for the three primary permission-axis inputs. ~20 lines.
+
+     **Acceptance.** `RUSTY_CLAUDE_PERMISSION_MODE=readonly claw status` exits non-zero with a structured error naming the invalid value and the accepted set. `RUSTY_CLAUDE_PERMISSION_MODE=dontAsk claw status` either resolves correctly via the shared parser (if the broad alias set is chosen) or errors loudly (if the narrow set is chosen) — no more accidental fall-through to the ultimate default. `claw doctor` JSON exposes the resolved `permission_mode` with `source` attribution. `claw --help` documents the env var.
+
+     **Blocker.** None. Parser-unification is ~30 lines. Env rejection is ~15 lines. Docs are ~10 lines. The broad-vs-narrow accepted-set decision is the only architectural question and can be resolved by checking existing user configs for alias usage; if `dontAsk` / `plan` / etc. are uncommon, narrow the set; if common, keep broad.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdV` on main HEAD `d63d58f` in response to Clawhip pinpoint nudge at `1494789577687437373`. Joins the **permission-audit sweep** (#50 / #87 / #91 / #94 / #97 / #101) on the env-var axis — the third and final permission-mode input surface. #50 (merge-edge cases), #87 (fresh-workspace default), #91 (CLI↔config parser mismatch), #94 (permission-rule validation), #97 (tool-allow-list), and now #101 (env-var silent fail-open) together audit every input surface for permission configuration. Cross-cluster with **silent-flag / documented-but-unenforced** (#96–#100) but qualitatively worse than that bundle: this is fail-OPEN, not fail-inert. And cross-cluster with **truth-audit** (#80–#87, #89, #100) because the operator has no way to verify the resolved permission_mode's source. Natural bundle: the six-way permission-audit sweep (#50 + #87 + #91 + #94 + #97 + **#101**) — the end-state cleanup that closes the entire permission-input attack surface in one pass.
