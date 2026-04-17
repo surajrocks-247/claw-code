@@ -1784,3 +1784,45 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
    **Blocker.** None. Pieces 1–3 are ~20–30 lines across the two parsers and the status JSON builder. Piece 4 (real plan-mode) is orthogonal and can ship independently.
 
    **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdC` on main HEAD `478ba55` in response to Clawhip pinpoint nudge at `1494714078965403848`. Second member of the "redaction-surface / reporting-surface is incomplete" sub-cluster after #90, and a direct sibling of #87 ("permission mode source invisible"): #87 is "fallback vs explicit" provenance loss; #91 is "alias vs canonical" provenance loss. Together with #87 they pin the permission-reporting surface from two angles. Different axis from the truth-audit cluster (#80–#86, #89): here the surface is not reporting a wrong value — it is canonicalizing an alias losslessly *and silently* in a way that loses the operator's intent.
+
+92. **MCP `command`, `args`, and `url` config fields are passed to `execve`/URL-parse **verbatim** — no `${VAR}` interpolation, no `~/` home expansion, no preflight check, no doctor warning — so standard config patterns silently fail at MCP connect time with confusing "No such file or directory" errors** — dogfooded 2026-04-18 on main HEAD `d0de86e` from `/tmp/cdE`. Every MCP stdio configuration on the web uses `${VAR}` / `~/...` syntax for command paths and credentials; `claw` stores them literally and hands the literal strings to `Command::new` at spawn time.
+
+   **Concrete repros.**
+
+   *Tilde not expanded.*
+   ```json
+   {"mcpServers":{"with-tilde":{"command":"~/bin/my-server","args":["~/config/file.json"]}}}
+   ```
+   `claw --output-format json mcp show with-tilde` → `{"command":"~/bin/my-server","args":["~/config/file.json"]}`. `doctor` says `config: ok`. A later `claw` invocation that actually activates the MCP server spawns `execve("~/bin/my-server", ["~/config/file.json"])` — `execve` does not expand `~/`, the spawn fails with `ENOENT`, and the error surface at the far end of the MCP client startup path has lost all context about why.
+
+   *`${VAR}` not interpolated.*
+   ```json
+   {"mcpServers":{"uses-env":{
+     "command":"${HOME}/bin/my-server",
+     "args":["--tenant=${TENANT_ID}","--token=${MY_TOKEN}"]}}}
+   ```
+   `claw mcp show uses-env` JSON: `"command":"${HOME}/bin/my-server", "args":["--tenant=${TENANT_ID}","--token=${MY_TOKEN}"]`. Literal. At spawn time: `execve("${HOME}/bin/my-server", …)` → `ENOENT`. `MY_TOKEN` is never pulled from the process env; instead the literal string `${MY_TOKEN}` is passed to the MCP server as the token argument.
+
+   *`url`, `headers`, `headersHelper` have the same shape.* The http / sse / ws transports store `url`, `headers`, and `headers_helper` verbatim from the config; no `${VAR}` interpolation anywhere in `rust/crates/runtime/src/config.rs` or `rust/crates/runtime/src/mcp_*.rs`. An operator who writes `"Authorization": "Bearer ${API_TOKEN}"` sends the literal string `Bearer ${API_TOKEN}` as the HTTP header value.
+
+   **Trace path.**
+    - `rust/crates/runtime/src/config.rs` — `parse_mcp_server_config` and its siblings load `command`, `args`, `env`, `url`, `headers`, `headers_helper` as raw strings into `McpStdioServerConfig` / `McpHttpServerConfig` / `McpSseServerConfig`. No interpolation helper is called.
+    - `rust/crates/runtime/src/mcp_stdio.rs:1150-1170` — `McpStdioProcess::spawn` is `let mut command = Command::new(&transport.command); command.args(&transport.args); apply_env(&mut command, &transport.env); command.spawn()?`. The fields go straight into `std::process::Command`, which passes them to `execve` unchanged. `grep -rn 'interpolate\|expand_env\|substitute\|\${' rust/crates/runtime/src/` returns empty outside format-string literals.
+    - `rust/crates/commands/src/lib.rs:3972-3999` — the MCP reporting surface echoes the literals straight back (see #90). So the only hint an operator has that interpolation *didn't* happen is that the `${VAR}` is still visible in `claw mcp show` output — which is a subtle signal that they'd have to recognize to diagnose, and which is **opposite** to how most CLI tools behave (which interpolate and then echo the resolved value).
+
+   **Why this is specifically a clawability gap.**
+    1. *Silent mismatch with ecosystem convention.* Every public MCP server README (`@modelcontextprotocol/server-filesystem`, `@modelcontextprotocol/server-github`, etc.) uses `${VAR}` / `~/` in example configs. Operators copy-paste those configs expecting standard shell-style interpolation. `claw` accepts the config, reports `doctor: ok`, and fails opaquely at spawn. The failure mode is far from the cause.
+    2. *Secret-placement footgun.* Operators who know the interpolation is missing are forced to either (a) hardcode secrets in `.claw.json` (which triggers the #90 redaction problem) or (b) write a wrapper shell script as the `command` and interpolate there. Both paths push them toward worse security postures than the ecosystem norm.
+    3. *Doctor surface is silent about the risk.* No check in `claw doctor` greps `command` / `args` / `url` / `headers` for literal `${`, `$`, `~/` and flags them. A clawhip preflight that gates on `doctor.status == "ok"` proceeds to spawn a lane whose MCP server will fail.
+    4. *Error at the far end is unhelpful.* When the spawn does fail at MCP connect time, the error originates in `mcp_stdio.rs`'s `spawn()` returning an `io::Error` whose text is something like `"No such file or directory (os error 2)"`. The user-facing error path strips the command path, loses the "we passed `${HOME}/bin/my-server` to execve literally" context, and prints a generic `ENOENT` with no pointer back to the config source.
+    5. *Round-trip from upstream configs fails.* ROADMAP #88 (Claude Code parity) and the general "run existing MCP configs on claw" use case presume operators can copy Claude Code / other-harness `.mcp.json` files over. Literal-`${VAR}` behavior breaks that assumption for any config that uses interpolation — which is most of them.
+
+   **Fix shape — two pieces, low-risk.**
+   1. *Add interpolation at config-load time.* In `parse_mcp_server_config` (or a shared `resolve_config_strings` helper in `runtime/src/config.rs`), expand `${VAR}` and `~/` in `command`, `args`, `url`, `headers`, `headers_helper`, `install_root`, `registry_path`, `bundled_root`, and similar string-path fields. Use a conservative substitution (only fully-formed `${VAR}` / leading `~/`; do not touch bare `$VAR`). Missing-variable policy: default to empty string with a `warning:` printed on stderr + captured into `ConfigLoader::all_warnings`, so a typo like `${APIP_KEY}` (missing `_`) is loud. Make the substitution optional via a `{"config": {"expand_env": false}}` settings toggle for operators who specifically want literal `$`/`~` in paths.
+   2. *Add a `mcp_config_interpolation` doctor check.* When any MCP `command`/`args`/`url`/`headers`/`headers_helper` contains a literal `${`, bare `$VAR`, or leading `~/`, emit `DiagnosticLevel::Warn` naming the field and server. Lets a clawhip preflight distinguish "operator forgot to export the env var" from "operator's config is fundamentally wrong." Pairs cleanly with #90's `mcp_secret_posture` check.
+
+   **Acceptance.** `{"command":"${HOME}/bin/x","args":["--tenant=${TENANT_ID}"]}` with `TENANT_ID=t1` in the env spawns `/home/<user>/bin/x --tenant=t1` (or reports a clear `${UNDEFINED_VAR}` error at config-load time, not at spawn time). `doctor` warns on any remaining literal `${` / `~/` in MCP config fields. `mcp show` reports the resolved value so operators can confirm interpolation worked before hitting a spawn failure.
+
+   **Blocker.** None. Substitution is ~30–50 lines of string handling + a regression-test sweep across the five config fields. Doctor check is another ~15 lines mirroring `check_sandbox_health` shape.
+
+   **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdE` on main HEAD `d0de86e` in response to Clawhip pinpoint nudge at `1494721628917989417`. Third member of the reporting-surface sub-cluster (`#90` leaking unredacted secrets, `#91` misaligned permission-mode aliases, `#92` literal-interpolation silence). Adjacent to ROADMAP principle #6 ("Plugin/MCP failures are under-classified"): this is a specific instance where a config-time failure is deferred to spawn-time and arrives at the operator stripped of the context that would let them diagnose it. Distinct from the truth-audit cluster (#80–#87, #89): the config *accurately* stores what was written; the bug is that no runtime code resolves the standard ecosystem-idiomatic sigils those strings contain.
