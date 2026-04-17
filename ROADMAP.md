@@ -1194,3 +1194,39 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
     - (e) Add table-driven regression coverage parallel to `output_format_contract.rs::doctor_and_resume_status_emit_json_when_requested`, one assertion per `ErrorKind` variant.
 
    **Acceptance.** A downstream claw/clawhip consumer can switch on `payload.kind` (`missing_credentials`, `missing_manifests`, `session_not_found`, ...) instead of regex-scraping `error` prose; the `hint` runbook stops being stuffed into the short reason; and the JSON envelope becomes symmetric with the success side. **Source.** Jobdori dogfood 2026-04-17 against a throwaway `/tmp/claw-dogfood-*` workspace on main HEAD `00d0eb6` in response to Clawhip pinpoint nudge at `1494593284180414484`.
+
+78. **`claw plugins` CLI route is wired as a `CliAction` variant but never constructed by `parse_args`; invocation falls through to LLM-prompt dispatch** — dogfooded 2026-04-17 on main HEAD `d05c868`. `claw agents`, `claw mcp`, `claw skills`, `claw acp`, `claw bootstrap-plan`, `claw system-prompt`, `claw init`, `claw dump-manifests`, and `claw export` all resolve to local CLI routes and emit structured JSON (`{"kind": "agents", ...}` / `{"kind": "mcp", ...}` / etc.) without provider credentials. `claw plugins` does not — it is the sole documented-shaped subcommand that falls through to the `_other => CliAction::Prompt { ... }` arm in `parse_args`. Concrete repros on a clean workspace (`/tmp/claw-dogfood-2`, throwaway git init):
+    - `claw plugins` → `error: missing Anthropic credentials; ...` (prose)
+    - `claw plugins list` → same credentials error
+    - `claw --output-format json plugins list` → `{"type":"error","error":"missing Anthropic credentials; ..."}`
+    - `claw plugins --help` → same credentials error (no help topic path for `plugins`)
+    - Contrast `claw --output-format json agents` / `mcp` / `skills` → each returns a structured `{"kind":..., "action":"list", ...}` success envelope
+
+   The `/plugin` slash command explicitly advertises `/plugins` / `/marketplace` as aliases in `--help`, and the `SlashCommand::Plugins { action, target }` handler exists in `rust/crates/commands/src/lib.rs:1681-1745`, so interactive/resume users have a working surface. The dogfood gap is the **non-interactive CLI entrypoint only**.
+
+   **Trace path.** `rust/crates/rusty-claude-cli/src/main.rs:
+    - Line 202-206: `CliAction::Plugins { action, target, output_format } => LiveCli::print_plugins(...)` — handler exists and is wired into `run()`.
+    - Line 303-307: `enum CliAction { ... Plugins { action: Option<String>, target: Option<String>, output_format: CliOutputFormat }, ... }` — variant type is defined.
+    - Line ~640-716 (`fn parse_args`): the subcommand match has arms for `"dump-manifests"`, `"bootstrap-plan"`, `"agents"`, `"mcp"`, `"skills"`, `"system-prompt"`, `"acp"`, `"login/logout"`, `"init"`, `"export"`, `"prompt"`, then catch-all slash-dispatch, then `_other => CliAction::Prompt { ... }`. **No `"plugins"` arm exists.** The variant is declared and consumed but never constructed.
+    - `grep CliAction::Plugins crates/ -rn` returns a single hit at line 202 (the handler), proving the constructor is absent from the parser.
+
+   **Fix shape.**
+    - (a) Add a `"plugins"` arm to the `parse_args` subcommand match in `main.rs` parallel to `"agents"` / `"mcp"`:
+      ```rust
+      "plugins" => Ok(CliAction::Plugins {
+          action: rest.get(1).cloned(),
+          target: rest.get(2).cloned(),
+          output_format,
+      }),
+      ```
+      (exact argument shape should mirror how `print_plugins(action, target, output_format)` is called so `list` / `install <path>` / `enable <name>` / `disable <name>` / `uninstall <id>` / `update <id>` work as non-interactive CLI invocations, matching the slash-command actions already handled by `commands::parse_plugin_command` in `rust/crates/commands/src/lib.rs`).
+    - (b) Add a help topic branch so `claw plugins --help` lands on a local help-topic path instead of the LLM-prompt fallthrough (mirror the pattern used by `claw acp --help` via `parse_local_help_action`).
+    - (c) Add parse-time unit coverage parallel to the existing `parse_args(&["agents".to_string()])` / `parse_args(&["mcp".to_string()])` / `parse_args(&["skills".to_string()])` tests at `crates/rusty-claude-cli/src/main.rs:9195-9240` — one test per documented action (`list`, `install <path>`, `enable <name>`, `disable <name>`, `uninstall <id>`, `update <id>`).
+    - (d) Add an `output_format_contract.rs` assertion that `claw --output-format json plugins` emits `{"kind":"plugins", ...}` with no credentials error, proving the CLI route no longer falls through to Prompt.
+    - (e) Add a `claw plugins` entry to `--help` usage text next to `claw agents` / `claw mcp` / `claw skills` so the CLI surface matches the now-implemented route. Currently `--help` only lists `claw agents`, `claw mcp`, `claw skills` — `claw plugins` is absent from the usage block even though the handler exists.
+
+   **Acceptance.** Unattended dogfood/backlog sweeps that ask `claw --output-format json plugins list` can enumerate installed plugins without needing Anthropic credentials or interactive resume; `claw plugins --help` lands on a help topic; CLI surface becomes symmetric with `agents` / `mcp` / `skills` / `acp`; and the `CliAction::Plugins` variant stops being a dead constructor in the source tree.
+
+   **Blocker.** None. Implementation is bounded to ~15 lines of parser in `main.rs` plus the help/test wiring noted above. Scope matches the same surface that was hardened for `agents` / `mcp` / `skills` already.
+
+   **Source.** Jobdori dogfood 2026-04-17 against `/tmp/claw-dogfood-2` on main HEAD `d05c868` in response to Clawhip pinpoint nudge at `1494600832652546151`. Related but distinct from ROADMAP #40/#41 (which harden the *plugin registry report* content + test isolation) and ROADMAP #39 (stub slash-command surface hiding); this is the non-interactive CLI entrypoint contract.
