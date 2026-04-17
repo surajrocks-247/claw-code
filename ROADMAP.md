@@ -2451,3 +2451,79 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. Parser-unification is ~30 lines. Env rejection is ~15 lines. Docs are ~10 lines. The broad-vs-narrow accepted-set decision is the only architectural question and can be resolved by checking existing user configs for alias usage; if `dontAsk` / `plan` / etc. are uncommon, narrow the set; if common, keep broad.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdV` on main HEAD `d63d58f` in response to Clawhip pinpoint nudge at `1494789577687437373`. Joins the **permission-audit sweep** (#50 / #87 / #91 / #94 / #97 / #101) on the env-var axis — the third and final permission-mode input surface. #50 (merge-edge cases), #87 (fresh-workspace default), #91 (CLI↔config parser mismatch), #94 (permission-rule validation), #97 (tool-allow-list), and now #101 (env-var silent fail-open) together audit every input surface for permission configuration. Cross-cluster with **silent-flag / documented-but-unenforced** (#96–#100) but qualitatively worse than that bundle: this is fail-OPEN, not fail-inert. And cross-cluster with **truth-audit** (#80–#87, #89, #100) because the operator has no way to verify the resolved permission_mode's source. Natural bundle: the six-way permission-audit sweep (#50 + #87 + #91 + #94 + #97 + **#101**) — the end-state cleanup that closes the entire permission-input attack surface in one pass.
+
+102. **`claw mcp list` / `claw mcp show` / `claw doctor` surface MCP servers at *configure-time* only — no preflight, no liveness probe, not even a `command-exists-on-PATH` check. A `.claw.json` pointing at `/does/not/exist` as an MCP server command cheerfully reports `found: true` in `mcp show`, `configured_servers: 1` in `mcp list`, `MCP servers: 1` in `doctor` config check, and `status: ok` overall. The actual reachability / startup failure only surfaces when the agent tries to *use* a tool from that server mid-turn — exactly the diagnostic surprise the Roadmap's Phase 2 §4 "Canonical lane event schema" and Product Principle #5 "Partial success is first-class" were written to avoid** — dogfooded 2026-04-18 on main HEAD `eabd257` from `/tmp/cdW2`. A three-server config with 2 broken commands currently shows up everywhere as "Config: ok, MCP servers: 3." An orchestrating claw cannot tell from JSON alone which of its tool surfaces will actually respond.
+
+     **Concrete repro.**
+     ```
+     $ cd /tmp/cdW2 && git init -q .
+     $ cat > .claw.json <<'JSON'
+     {
+       "mcpServers": {
+         "unreachable": {
+           "command": "/does/not/exist",
+           "args": []
+         }
+       }
+     }
+     JSON
+     $ claw --output-format json mcp list | jq '.servers[0].summary, .configured_servers'
+     "/does/not/exist"
+     1
+     # mcp list reports 1 configured server, no status field, no reachability probe
+
+     $ claw --output-format json mcp show unreachable | jq '.found, .server.details.command'
+     true
+     "/does/not/exist"
+     # `found: true` for a command that doesn't exist on disk — the "finding" is purely config-level
+
+     $ claw --output-format json doctor | jq '.checks[] | select(.name == "config") | {status, summary, details}'
+     {
+       "status": "ok",
+       "summary": "runtime config loaded successfully",
+       "details": [
+         "Config files      loaded 1/1",
+         "MCP servers       1",
+         "Discovered file   /private/tmp/cdW2/.claw.json"
+       ]
+     }
+     # doctor: all ok. The broken server is invisible.
+
+     $ claw --output-format json doctor | jq '.summary, .has_failures'
+     {"failures": 0, "ok": 4, "total": 6, "warnings": 2}
+     false
+     # has_failures: false, despite a 100%-unreachable MCP server
+     ```
+
+     **Trace path.**
+     - `rust/crates/rusty-claude-cli/src/main.rs:1701-1780` — `check_config_health` is the doctor check that touches MCP config. It counts configured servers via `runtime_config.mcp().servers().len()` and emits `MCP servers: {n}` in the detail list. It does not invoke any MCP startup helper, not even a "does this command resolve on PATH" stub. No separate `check_mcp_health` exists.
+     - `rust/crates/rusty-claude-cli/src/main.rs` — `render_doctor_report` assembles six checks: `auth`, `config`, `install_source`, `workspace`, `sandbox`, `system`. No MCP-specific check. No plugin-liveness check. No tool-surface-health check.
+     - `rust/crates/commands/src/lib.rs` — the `mcp list` / `mcp show` handlers format the config-side representation of each server (transport, command, args, env_keys, tool_call_timeout_ms). The output includes `summary: <command>` and `scope: {id, label}` but no `status` / `reachable` / `startup_state` field. `found` in `mcp show` is strictly config-presence, not runtime presence.
+     - `rust/crates/runtime/src/mcp_stdio.rs` — the MCP startup machinery exists and has its own error types. It knows how to `spawn()` and how to detect startup failures. But these paths are only invoked at turn-execution time, when the agent actually calls an MCP tool — too late for a pre-flight.
+     - `rust/crates/runtime/src/config.rs:953-1000` — `parse_mcp_server_config` and `parse_mcp_remote_server_config` validate the shape of the config entry (required fields, valid transport kinds) but perform no filesystem or network touch. A `command: "/does/not/exist"` parses fine.
+     - Verified absence: `grep -rn "Command::new\(...\).arg\(.*--version\).*mcp\|which\|std::fs::metadata\(.*command\)" rust/crates/commands/ rust/crates/runtime/src/mcp_stdio.rs rust/crates/rusty-claude-cli/src/main.rs` returns zero hits. No code exists anywhere that cheaply checks "does this MCP command exist on the filesystem or PATH?"
+
+     **Why this is specifically a clawability gap.**
+     1. *Roadmap Phase 2 §4 prescribes this exact surface.* The canonical lane event schema includes `lane.ready` and contract-level startup signals. Phase 1 §3.5 ("Boot preflight / doctor contract") explicitly lists "MCP config presence and server reachability expectations" as a required preflight check. Phase 4.4.4 ("Event provenance / environment labeling") expects MCP startup to emit typed success/failure events. The doctor surface is today the machine-readable foothold for all three of those product principles and it reports config presence only.
+     2. *Product Principle #5 "Partial success is first-class"* says "MCP startup can succeed for some servers and fail for others, with structured degraded-mode reporting." Today's doctor JSON has no field to express per-server liveness. There is no `servers[].startup_state`, `servers[].reachable`, `servers[].last_error`, `degraded_mode: bool`, or `partial_startup_count`.
+     3. *Sibling of #100.* #100 is "commit identity missing from status/doctor JSON — machinery exists but is JSON-invisible." #102 is the same shape on the MCP axis: the startup machinery exists in `runtime::mcp_stdio`, doctor only surfaces config-time counts. Both are "subsystem present, JSON-invisible."
+     4. *A trivial first tranche is free.* `which(command)` on stdio servers, `TcpStream::connect(url, 1s timeout)` on http/sse servers — each is <10 lines and would already classify every "totally broken" vs "actually wired up" server. No full MCP handshake required to give a huge clawability win.
+     5. *Undetected-breakage amplification.* A claw that reads `doctor` → `ok` and relies on an MCP tool will discover the breakage only when the LLM actually tries to call that tool, burning tokens on a failed tool call and forcing a retry loop. Preflight would catch this at lane-spawn time, before any tokens are spent.
+     6. *Config parser already validated shape, never content.* `parse_mcp_server_config` catches type errors (`url: 123` rejected, per the tests at `config.rs:1745`). But it never reaches out of the JSON to touch the filesystem. A typo like `command: "/usr/local/bin/mcp-servr"` (missing `e`) is indistinguishable from a working config.
+
+     **Fix shape — add a cheap MCP preflight to doctor + expose per-server reachability in `mcp list`.**
+     1. *Add `check_mcp_health` to the doctor check set.* Iterate over `runtime_config.mcp().servers()`. For stdio transport, run `which(command)` (or `std::fs::metadata(command)` if the command looks like an absolute path). For http/sse transport, attempt a 1s-timeout TCP connect (not a full handshake). Aggregate results: `ok` if all servers resolve, `warn` if some resolve, `fail` if none resolve. Emit per-server detail lines:
+        ```
+        MCP server       {name}        {resolved|command_not_found|connect_timeout|...}
+        ```
+        ~50 lines.
+     2. *Expose per-server `status` in `mcp list` / `mcp show` JSON.* Add a `status: "configured"|"resolved"|"command_not_found"|"connect_refused"|"startup_failed"` field to each server entry. Do NOT do a full handshake in list/show by default — those are meant to be cheap. Add a `--probe` flag for callers that want the deeper check. ~30 lines.
+     3. *Populate `degraded_mode: bool` and `startup_summary` at the top-level doctor JSON.* Matches Product Principle #5's "partial success is first-class." ~10 lines.
+     4. *Wire the preflight into the prompt/repl bootstrap path.* When a lane starts, emit a one-time `mcp_preflight` event with the resolved status of each configured server. Feeds the Phase 2 §4 lane event schema directly. ~20 lines.
+     5. *Regression tests.* One per reachability state. One for partial startup (one server resolves, one fails). One for all-resolved. One for zero-servers (should not invent a warning).
+
+     **Acceptance.** `claw doctor --output-format json` on a workspace with a broken MCP server (`command: "/does/not/exist"`) emits `{status: "warn"|"fail", degraded_mode: true, servers: [{name, status: "command_not_found", ...}]}`. `claw mcp list` exposes per-server `status` distinguishing `configured` from `resolved`. A lane that reads `doctor` can tell whether all its MCP surfaces will respond before burning its first token on a tool call.
+
+     **Blocker.** None. The cheapest tier (`which` / absolute-path existence check) is ~10 lines per server transport class and closes the "command doesn't exist on disk" gap entirely. Deeper handshake probes can be added later behind an opt-in `--probe` flag.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdW2` on main HEAD `eabd257` in response to Clawhip pinpoint nudge at `1494797126041862285`. Joins the **unplumbed-subsystem** cross-cluster with #78 (`claw plugins` route never constructed) and #100 (stale-base JSON-invisible) — same shape: machinery exists, diagnostic surface doesn't expose it. Joins **truth-audit / diagnostic-integrity** (#80-#84, #86, #87, #89, #100) because `doctor: ok` is a lie when MCP servers are unreachable. Directly implements the roadmap's own Phase 1 §3.5 (boot preflight), Phase 2 §4 (canonical lane events), Phase 4.4.4 (event provenance), and Product Principle #5 (partial success is first-class). Natural bundle: **#78 + #100 + #102** (unplumbed-surface quartet, now with #96) — four surfaces where the subsystem exists but the JSON diagnostic doesn't expose it; tight family PR. Also **#100 + #102** as the pure "doctor surface coverage" 2-way: #100 surfaces commit identity, #102 surfaces MCP reachability, together they let `claw doctor` actually live up to its name.
