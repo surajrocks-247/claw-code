@@ -2707,3 +2707,88 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. Unification + extension-preservation is ~50 lines. Path-traversal policy is ~20 lines + an architectural decision on whether to restrict. All additive, backward-compatible if the "append `.txt` if extension isn't `.txt`" logic is replaced with "pass through whatever the caller asked for."
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdY` on main HEAD `7447232` in response to Clawhip pinpoint nudge at `1494812230372294849`. Joins the **silent-flag / documented-but-unenforced** cluster (#96-#101) on the filename-rewrite dimension: documented interface is `/export [file]`, actual behavior silently rewrites the file extension. Joins the **two-paths-diverge** sub-cluster with the permission-mode parser disagreement (#91) and CLI↔env surface mismatch (#101): different input surfaces for the same logical action with non-equivalent semantics. Natural bundle: **#91 + #101 + #104** — three instances of the same meta-pattern (parallel entry points to the same subsystem that do subtly different things). Also **#96 + #98 + #99 + #101 + #104** as the full silent-rewrite-or-silent-noop quintet.
+
+105. **`claw status` ignores `.claw.json`'s `model` field entirely and always reports the compile-time `DEFAULT_MODEL` (`claude-opus-4-6`), while `claw doctor` reports the raw *configured* alias string (e.g. `haiku`) mislabeled as "Resolved model", and the actual turn-dispatch path resolves the alias to the canonical name (e.g. `claude-haiku-4-5-20251213`) via a third code path (`resolve_repl_model`). Four separate surfaces disagree on "what is this lane's active model?": config file (alias as written), `doctor` (alias mislabeled as resolved), `status` (hardcoded default, config ignored), and turn dispatch (canonical, alias-resolved). A claw reading `status` JSON to pick a tool/routing strategy based on the active model will make decisions against a model string that is neither configured nor actually used** — dogfooded 2026-04-18 on main HEAD `6580903` from `/tmp/cdZ`. `.claw.json` with `{"model":"haiku"}` produces `status.model = "claude-opus-4-6"` and `doctor` config detail `Resolved model    haiku` simultaneously. Neither value matches what an actual turn would use (`claude-haiku-4-5-20251213`).
+
+     **Concrete repro.**
+     ```
+     $ cd /tmp/cdZ && git init -q .
+     $ echo '{"model":"haiku"}' > .claw.json
+
+     # status JSON — ignores config, returns DEFAULT_MODEL
+     $ claw --output-format json status | jq '.model'
+     "claude-opus-4-6"
+
+     # doctor — reads config, shows raw alias mislabeled as "Resolved"
+     $ claw --output-format json doctor | jq '.checks[] | select(.name=="config") | .details[] | select(contains("model"))'
+     "Resolved model    haiku"
+
+     # Actual resolution at turn dispatch would be claude-haiku-4-5-20251213
+     # (via resolve_repl_model → resolve_model_alias_with_config → resolve_model_alias)
+
+     $ echo '{"model":"claude-opus-4-6"}' > .claw.json
+     $ claw --output-format json status | jq '.model'
+     "claude-opus-4-6"
+     # Same status output regardless of what the config says
+     # The only reason it's "correct" here is that DEFAULT_MODEL happens to match.
+
+     $ echo '{"model":"sonnet"}' > .claw.json
+     $ claw --output-format json status | jq '.model'
+     "claude-opus-4-6"
+     # Config says sonnet. Status says opus. Reality (turn dispatch) would use claude-sonnet-4-6.
+     ```
+
+     **Trace path.**
+     - `rust/crates/rusty-claude-cli/src/main.rs:59` — `const DEFAULT_MODEL: &str = "claude-opus-4-6";`
+     - `rust/crates/rusty-claude-cli/src/main.rs:400` — `parse_args` starts with `let mut model = DEFAULT_MODEL.to_string();`. Model is set by `--model` flag only.
+     - `rust/crates/rusty-claude-cli/src/main.rs:753-757` — Status dispatch:
+       ```rust
+       "status" => Some(Ok(CliAction::Status {
+           model: model.to_string(),       // ← DEFAULT_MODEL unless --model flag given
+           permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
+           output_format,
+       })),
+       ```
+       No call to `config_model_for_current_dir()`, no alias resolution.
+     - `rust/crates/rusty-claude-cli/src/main.rs:222` — `CliAction::Status { model, ... } => print_status_snapshot(&model, ...)`. The hardcoded default flows straight into the status JSON builder.
+     - `rust/crates/rusty-claude-cli/src/main.rs:1125-1140` — `resolve_repl_model` (actual turn-dispatch model resolution):
+       ```rust
+       fn resolve_repl_model(cli_model: String) -> String {
+           if cli_model != DEFAULT_MODEL {
+               return cli_model;
+           }
+           if let Some(env_model) = env::var("ANTHROPIC_MODEL").ok()...{ return resolve_model_alias_with_config(&env_model); }
+           if let Some(config_model) = config_model_for_current_dir() { return resolve_model_alias_with_config(&config_model); }
+           cli_model
+       }
+       ```
+       **This is the function that actually produces the model a turn will use.** It consults `ANTHROPIC_MODEL` env, `config_model_for_current_dir`, and runs alias resolution. It is called from `Prompt` and `Repl` dispatch paths. **It is NOT called from the `Status` dispatch path.**
+     - `rust/crates/rusty-claude-cli/src/main.rs:1018-1024` — `resolve_model_alias`:
+       ```rust
+       "opus" => "claude-opus-4-6",
+       "sonnet" => "claude-sonnet-4-6",
+       "haiku" => "claude-haiku-4-5-20251213",
+       ```
+       Alias → canonical mapping. Only applied by `resolve_model_alias_with_config`, which `status` never calls.
+     - `rust/crates/rusty-claude-cli/src/main.rs:1701-1780` — `check_config_health` (doctor config check) emits `format!("Resolved model    {model}")` where `model` is whatever `runtime_config.model()` returned — the raw configured string, *not* alias-resolved. Label says "Resolved" but the value is the pre-resolution alias.
+
+     **Why this is specifically a clawability gap.**
+     1. *Four separate "active model" values.* Config file (what was written), `doctor` ("Resolved model" = raw alias), `status` (hardcoded DEFAULT_MODEL ignoring config entirely), turn dispatch (canonical, alias-resolved). A claw has no way from any single surface to know what the *real* active model is.
+     2. *Orchestration hazard.* A claw picks tool strategy or routing based on `status.model` — a reasonable assumption that `status` tells you the active model. The status JSON lies: it says "claude-opus-4-6" even when `.claw.json` says "haiku" and turns will actually run against haiku. A claw that specializes prompts for opus vs haiku will specialize for the wrong model.
+     3. *Label mismatch in doctor.* `doctor` reports "Resolved model    haiku" — the word "Resolved" implies alias resolution happened. It didn't. The actual resolved value is `claude-haiku-4-5-20251213`. The label is misleading.
+     4. *Silent config drop by status.* No warning, no error. A claw's `.claw.json` configuration is simply ignored by the most visible diagnostic surface. Operators debugging why "model switch isn't taking effect" get the same false-answer from `status` whether they configured haiku, sonnet, or anything else.
+     5. *ANTHROPIC_MODEL env var is also status-invisible.* `ANTHROPIC_MODEL=haiku claw --output-format json status | jq '.model'` returns `"claude-opus-4-6"`. Same as config: status ignores it. Actual turn dispatch honors it. Third surface that disagrees with status.
+     6. *Joins truth-audit cluster as a severe case.* #80 (`claw status` Project root vs session partition) and #87 (fresh-workspace default permissions) both captured "status lies by omission or wrong-default." This is "status lies by outright reporting a value that is not the real one, despite the information being readable from adjacent code paths."
+
+     **Fix shape — make status consult config + alias resolution, match doctor's honesty, align with turn dispatch.**
+     1. *Call `resolve_repl_model` from `print_status_snapshot`.* The function already exists and is the source of truth for "what model will this lane use." ~5 lines to route the status model through it before emitting JSON.
+     2. *Add an `effective_model` field to status JSON.* Field name choice: either replace `model` with the resolved value, or split into `configured_model` (from config), `env_model` (from `ANTHROPIC_MODEL`), and `effective_model` (what turns will use). The three-field form is more machine-readable; the single replaced field is simpler. Pick based on back-compat preference. ~15 lines.
+     3. *Fix doctor's "Resolved model" label.* Change to "Configured model" since that's what the value actually is, or alias-resolve before emitting so the label matches the content. ~5 lines.
+     4. *Honor `ANTHROPIC_MODEL` env in status.* Same resolution path as turn dispatch. ~3 lines.
+     5. *Regression tests.* One per model source (default / flag / env / config / alias / canonical). Assert `status`, `doctor`, and turn-dispatch model-resolution all produce equivalent values for the same inputs.
+
+     **Acceptance.** `.claw.json` with `{"model":"haiku"}` produces `status.model = "claude-haiku-4-5-20251213"` (or `status.effective_model` plus `configured_model: "haiku"` for the multi-field variant). `doctor` either labels the value "Configured model" (honest label for raw alias) or alias-resolves the value to match `status`. `ANTHROPIC_MODEL=sonnet claw status` shows `claude-sonnet-4-6`. All four surfaces agree.
+
+     **Blocker.** None. Calling `resolve_repl_model` from `status` is trivially small. The architectural decision is whether to rename `model` to `effective_model` (breaks consumers who rely on the current field semantics — but the current field is wrong anyway) or to add a sibling field (safer). Either way, ~30 lines plus tests.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdZ` on main HEAD `6580903` in response to Clawhip pinpoint nudge at `1494819785676947543`. Joins **truth-audit / diagnostic-integrity** (#80–#84, #86, #87, #89, #100, #102, #103) — status JSON lies about the active model. Joins **two-paths-diverge** (#91, #101, #104) — three separate model-resolution paths with incompatible outputs. Sibling of **#100** (status JSON missing commit identity) and **#102** (doctor silent on MCP reachability) — same pattern: status/doctor surfaces incomplete or wrong information about things they claim to report. Natural bundle: **#100 + #102 + #105** — status/doctor surface completeness triangle (commit identity + MCP reachability + model-resolution truth). Also **#91 + #101 + #104 + #105** — four-way parallel-entry-point asymmetry (config↔CLI parser, CLI↔env silent-vs-loud, slash↔CLI export, config↔status↔dispatch model). Session tally: ROADMAP #105.
