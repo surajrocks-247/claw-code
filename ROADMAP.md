@@ -2049,3 +2049,72 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
    **Blocker.** None. One-line filter addition plus one regression test. Same pattern as the existing Interactive-block filter.
 
    **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdK` on main HEAD `8db8e49` in response to Clawhip pinpoint nudge at `1494751832399024178`. A partial regression of ROADMAP #39 / #54 — the filter was applied to the primary slash-command listing and to REPL completions, but the `--help` Resume-safe one-liner was overlooked. New stubs added to `STUB_COMMANDS` since those filings keep propagating to this section. Sibling to #78 (`claw plugins` CLI route wired but never constructed): both are "surface advertises something that doesn't work at runtime" gaps in `--help` / parser coverage. Distinct from the truth-audit / discovery-overreach / reporting-surface clusters — this is a self-contradicting help surface, not a runtime-state or config-hygiene bug.
+
+97. **`--allowedTools ""` and `--allowedTools ",,"` silently yield an empty allow-set that blocks every tool, with no error, no warning, and no trace of the active tool-restriction anywhere in `claw status` / `claw doctor` / `claw --output-format json` surfaces — compounded by `allowedTools` being a *rejected unknown key* in `.claw.json`, so there is no machine-readable way to inspect or recover what the current active allow-set actually is** — dogfooded 2026-04-18 on main HEAD `3ab920a` from `/tmp/cdL`. `--allowedTools "nonsense"` correctly returns a structured error naming every valid tool. `--allowedTools ""` silently produces `Some(BTreeSet::new())` and all subsequent tool lookups fail `contains()` because the set is empty. Neither `status` JSON nor `doctor` JSON exposes `allowed_tools`, so a claw that accidentally restricted itself to zero tools has no observable signal to recover from.
+
+    **Concrete repro.**
+    ```
+    $ cd /tmp/cdL && git init -q .
+    $ ~/clawd/claw-code/rust/target/release/claw --allowedTools "" --output-format json doctor | head -5
+    {
+      "checks": [
+        {
+          "api_key_present": false,
+          ...
+    # exit 0, no warning about the empty allow-set
+    $ ~/clawd/claw-code/rust/target/release/claw --allowedTools ",," --output-format json status | jq '.kind'
+    "status"
+    # exit 0, empty allow-set silently accepted
+    $ ~/clawd/claw-code/rust/target/release/claw --allowedTools "nonsense" --output-format json doctor
+    {"error":"unsupported tool in --allowedTools: nonsense (expected one of: bash, read_file, write_file, edit_file, glob_search, grep_search, WebFetch, WebSearch, TodoWrite, Skill, Agent, ToolSearch, NotebookEdit, Sleep, SendUserMessage, Config, EnterPlanMode, ExitPlanMode, StructuredOutput, REPL, PowerShell, AskUserQuestion, TaskCreate, RunTaskPacket, TaskGet, TaskList, TaskStop, TaskUpdate, TaskOutput, WorkerCreate, WorkerGet, WorkerObserve, WorkerResolveTrust, WorkerAwaitReady, WorkerSendPrompt, WorkerRestart, WorkerTerminate, WorkerObserveCompletion, TeamCreate, TeamDelete, CronCreate, CronDelete, CronList, LSP, ListMcpResources, ReadMcpResource, McpAuth, RemoteTrigger, MCP, TestingPermission)","type":"error"}
+    # exit 0 with structured error — works as intended
+    $ echo '{"allowedTools":["Read"]}' > .claw.json
+    $ ~/clawd/claw-code/rust/target/release/claw --output-format json doctor | jq '.summary'
+    {"failures": 1, "ok": 3, "total": 6, "warnings": 2}
+    # .claw.json "allowedTools" → fail: `unknown key "allowedTools" (line 2)`
+    # config-file form is rejected; only CLI flag is the knob — and the CLI flag has the silent-empty footgun
+    $ ~/clawd/claw-code/rust/target/release/claw --allowedTools "Read" --output-format json status | jq 'keys'
+    ["kind", "model", "permission_mode", "sandbox", "usage", "workspace"]
+    # no allowed_tools field in status JSON — a lane cannot see what its own active allow-set is
+    ```
+
+    **Trace path.**
+    - `rust/crates/rusty-claude-cli/src/main.rs:561-576` — parse_args collects `--allowedTools` / `--allowed-tools` (space form and `=` form) into `allowed_tool_values: Vec<String>`. Empty string `""` and comma-only `",,"` pass through unchanged.
+    - `rust/crates/rusty-claude-cli/src/main.rs:594` — `let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;`
+    - `rust/crates/rusty-claude-cli/src/main.rs:1048-1054` — `normalize_allowed_tools` guard: `if values.is_empty() { return Ok(None); }`. **`[""]` is NOT empty** — `values.len() == 1`. Falls through to `current_tool_registry()?.normalize_allowed_tools(values)`.
+    - `rust/crates/tools/src/lib.rs:192-248` — `GlobalToolRegistry::normalize_allowed_tools`:
+      ```rust
+      let mut allowed = BTreeSet::new();
+      for value in values {
+          for token in value.split(|ch: char| ch == ',' || ch.is_whitespace())
+              .filter(|token| !token.is_empty()) {
+              let canonical = name_map.get(&normalized).ok_or_else(|| "unsupported tool in --allowedTools: ...")?;
+              allowed.insert(canonical.clone());
+          }
+      }
+      Ok(Some(allowed))
+      ```
+      With `values = [""]` the inner `token` iterator produces zero elements (all filtered by `!token.is_empty()`). The error-producing branch never runs. `allowed` stays empty. Returns `Ok(Some(BTreeSet::new()))` — an *active* allow-set with zero entries.
+    - `rust/crates/tools/src/lib.rs:247-278` — `GlobalToolRegistry::definitions(allowed_tools: Option<&BTreeSet<String>>)` filters each tool by `allowed_tools.is_none_or(|allowed| allowed.contains(name))`. `None` → all pass. `Some(empty)` → zero pass. So the silent-empty set silently disables every tool.
+    - `rust/crates/runtime/src/config.rs:2008-2035` — `.claw.json` with `allowedTools` is asserted to produce `unknown key "allowedTools" (line 2)` validation failure. Config-file form is explicitly *not supported*; the CLI flag is the only knob.
+    - `rust/crates/rusty-claude-cli/src/main.rs` (status JSON builder around `:4951`) — status output emits `kind, model, permission_mode, sandbox, usage, workspace`. No `allowed_tools` field. Doctor report (same file) emits auth, config, install_source, workspace, sandbox, system checks. No tool-restriction check.
+
+    **Why this is specifically a clawability gap.**
+    1. *Silent vs. loud asymmetry for equivalent mis-input.* Typo `--allowedTools "nonsens"` → loud structured error naming every valid tool. Typo `--allowedTools ""` (likely produced by a shell variable that expanded to empty: `--allowedTools "$TOOLS"`) → silent zero-tool lane. Shell interpolation failure modes land in the silent branch.
+    2. *No observable recovery surface.* A claw that booted with `--allowedTools ""` has no way to tell from `claw status`, `claw --output-format json status`, or `claw doctor` that its tool surface is empty. Every diagnostic says "ok." Failures surface only when the agent tries to call a tool and gets denied — pushing the problem to runtime prompt failures instead of preflight.
+    3. *Config-file surface is locked out.* `.claw.json` cannot declare `allowedTools` — it fails validation with "unknown key." So a team that wants committed, reviewable tool-restriction policy has no path; they can only pass CLI flags at boot. And the CLI flag has the silent-empty footgun. Asymmetric hygiene.
+    4. *Semantically ambiguous.* `--allowedTools ""` could reasonably mean (a) "no restriction, fall back to default," (b) "restrict to nothing, disable all tools," or (c) "invalid, error." The current behavior is silently (b) — the most surprising and least recoverable option. Compare to `.claw.json` where `"allowedTools": []` would be an explicit array literal — but that surface is disabled entirely.
+    5. *Adds to the permission-audit cluster.* #50 / #87 / #91 / #94 already cover permission-mode / permission-rule validation, default dangers, parser disagreement, and rule typo tolerance. #97 covers the *tool-allow-list* axis of the same problem: the knob exists, parses empty input silently, disables all tools, and hides its own active value from every diagnostic surface.
+
+    **Fix shape — small validator tightening + diagnostic surfacing.**
+    1. *Reject empty-token input at parse time.* In `normalize_allowed_tools` (tools/src/lib.rs:192), after the inner token loop, if the accumulated `allowed` set is empty *and* `values` was non-empty, return `Err("--allowedTools was provided with no usable tool names (got '{raw}'). To restrict to no tools explicitly, pass --allowedTools none; to remove the restriction, omit the flag.")`. ~10 lines.
+    2. *Support an explicit "none" sentinel if the "zero tools" lane is actually desirable.* If a claw legitimately wants "zero tools, purely conversational," accept `--allowedTools none` / `--allowedTools ""` with an explicit opt-in. But reject the ambiguous silent path.
+    3. *Surface active allow-set in `status` JSON and `doctor` JSON.* Add a top-level `allowed_tools: {source: "flag"|"config"|"default", entries: [...]}` field to the status JSON builder (main.rs `:4951`). Add a `tool_restrictions` doctor check that reports the active allow-set and flags suspicious shapes (empty, single tool, missing Read/Bash for a coding lane). ~40 lines across status + doctor.
+    4. *Accept `allowedTools` (or a safer alternative name) in `.claw.json`.* Or emit a clearer error pointing to the CLI flag as the correct surface. Right now `allowedTools` is silently treated as "unknown field," which is technically correct but operationally hostile — the user typed a plausible key name and got a generic schema failure.
+    5. *Regression tests.* One for `normalize_allowed_tools(&[""])` returning `Err`. One for `--allowedTools ""` on the CLI returning a non-zero exit with a structured error. One for status JSON exposing `allowed_tools` when the flag is active.
+
+    **Acceptance.** `claw --allowedTools "" doctor` exits non-zero with a structured error pointing at the ambiguous input (or succeeds with an *explicit* empty allow-set if `--allowedTools none` is the opt-in). `claw --allowedTools "Read" --output-format json status` exposes `allowed_tools.entries: ["read_file"]` at the top level. `claw --output-format json doctor` includes a `tool_restrictions` check reflecting the active allow-set source + entries. `.claw.json` with `allowedTools` either loads successfully or fails with an error that names the CLI flag as the correct surface.
+
+    **Blocker.** None. Tightening the parser is ~10 lines. Surfacing the active allow-set in status JSON is ~15 lines. Adding the doctor check is ~25 lines. Accepting `allowedTools` in config — or improving its rejection message — is ~10 lines. All tractable in one small PR.
+
+    **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdL` on main HEAD `3ab920a` in response to Clawhip pinpoint nudge at `1494759381068419115`. Joins the **permission-audit sweep** (#50 / #87 / #91 / #94) on a new axis: those four cover permission *modes* and *rules*; #97 covers the *tool-allow-list* knob with the same class of problem (silent input handling + missing diagnostic visibility). Also sibling of **#86** (corrupt `.claw.json` silently dropped, doctor reports ok) on the truth-audit side: both are "misconfigured claws have no observable signal." Natural 3-way bundle: **#86 + #94 + #97** all add diagnostic coverage to `claw doctor` for configuration hygiene the current surface silently swallows.
