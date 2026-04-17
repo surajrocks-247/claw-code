@@ -2792,3 +2792,88 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. Calling `resolve_repl_model` from `status` is trivially small. The architectural decision is whether to rename `model` to `effective_model` (breaks consumers who rely on the current field semantics — but the current field is wrong anyway) or to add a sibling field (safer). Either way, ~30 lines plus tests.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdZ` on main HEAD `6580903` in response to Clawhip pinpoint nudge at `1494819785676947543`. Joins **truth-audit / diagnostic-integrity** (#80–#84, #86, #87, #89, #100, #102, #103) — status JSON lies about the active model. Joins **two-paths-diverge** (#91, #101, #104) — three separate model-resolution paths with incompatible outputs. Sibling of **#100** (status JSON missing commit identity) and **#102** (doctor silent on MCP reachability) — same pattern: status/doctor surfaces incomplete or wrong information about things they claim to report. Natural bundle: **#100 + #102 + #105** — status/doctor surface completeness triangle (commit identity + MCP reachability + model-resolution truth). Also **#91 + #101 + #104 + #105** — four-way parallel-entry-point asymmetry (config↔CLI parser, CLI↔env silent-vs-loud, slash↔CLI export, config↔status↔dispatch model). Session tally: ROADMAP #105.
+
+106. **Config merge uses `deep_merge_objects` which recurses into nested objects but REPLACES arrays — so `permissions.allow`, `permissions.deny`, `permissions.ask`, `hooks.PreToolUse`, `hooks.PostToolUse`, `hooks.PostToolUseFailure`, and `plugins.externalDirectories` from an earlier config layer are silently discarded whenever a later layer sets the same key. A user-home `~/.claw/settings.json` with `permissions.deny: ["Bash(rm *)"]` is silently overridden by a project `.claw.json` with `permissions.deny: ["Bash(sudo *)"]` — the user's `Bash(rm *)` deny is GONE and never surfaced. Worse: a workspace-local `.claw/settings.local.json` with `permissions.deny: []` silently removes every deny rule from every layer above it** — dogfooded 2026-04-18 on main HEAD `71e7729` from `/tmp/cdAA`. MCP servers *are* merged by-key (distinct server names from different layers coexist), but permission-rule arrays and hook arrays are NOT — they are last-writer-wins for the entire list. This makes claw-code's config merge incompatible with any multi-tier permission policy (team default → project override → local tweak) that a security-conscious team would want, and it is the exact failure mode #91 / #94 / #101 warned about on adjacent axes.
+
+     **Concrete repro.**
+     ```
+     $ # User-home config: restrictive defaults
+     $ mkdir -p ~/.claw
+     $ cat > ~/.claw/settings.json << 'JSON'
+     {
+       "permissions": {
+         "defaultMode": "workspace-write",
+         "deny": ["Bash(rm *)", "Bash(sudo *)", "Bash(curl * | sh)"],
+         "allow": ["Read(/**)", "Bash(ls *)"]
+       },
+       "hooks": {
+         "PreToolUse": ["/usr/local/bin/security-audit-hook.sh"]
+       }
+     }
+     JSON
+
+     $ # Project config: project-specific tweak
+     $ echo '{"permissions":{"allow":["Edit(*)"]},"hooks":{"PreToolUse":["/project/prefill.sh"]}}' > .claw.json
+
+     $ # The merged result:
+     # permissions.deny → [] (user's three deny rules DISCARDED — project config didn't mention deny at all,
+     #                       but actually since project doesn't touch deny, the merged deny KEEPS user's value.
+     #                       However if project had ANY deny array, user's is lost.)
+     #
+     # permissions.allow → ["Edit(*)"]  (user's ["Read(/**)", "Bash(ls *)"] DISCARDED)
+     #
+     # hooks.PreToolUse → ["/project/prefill.sh"]  (user's security-audit-hook.sh DISCARDED)
+
+     $ # Worst case: settings.local.json explicitly empties the deny array
+     $ echo '{"permissions":{"deny":[]}}' > .claw/settings.local.json
+     # Now the MERGED permissions.deny is [] — every deny rule from every upstream layer silently removed.
+     # doctor reports: runtime config loaded successfully, 3/3 files, no warnings.
+
+     $ # Trace: deep_merge_objects at config.rs:1216-1230
+     $ cat rust/crates/runtime/src/config.rs | sed -n '1216,1230p'
+     fn deep_merge_objects(target: &mut BTreeMap<String, JsonValue>, source: &BTreeMap<String, JsonValue>) {
+         for (key, value) in source {
+             match (target.get_mut(key), value) {
+                 (Some(JsonValue::Object(existing)), JsonValue::Object(incoming)) => {
+                     deep_merge_objects(existing, incoming);        // recurse for objects
+                 }
+                 _ => {
+                     target.insert(key.clone(), value.clone());     // REPLACE for everything else (including arrays)
+                 }
+             }
+         }
+     }
+     ```
+
+     **Trace path.**
+     - `rust/crates/runtime/src/config.rs:1216-1230` — `deep_merge_objects`: recurses into nested objects, replaces arrays and primitives. Arrays are NOT concatenated, deduplicated, or merged by any element identity.
+     - `rust/crates/runtime/src/config.rs:242-270` — `ConfigLoader::discover` returns 5 sources in order: user (legacy `~/.claw.json`), user (`~/.claw/settings.json`), project (`.claw.json`), project (`.claw/settings.json`), local (`.claw/settings.local.json`). Later sources win on array-valued keys.
+     - `rust/crates/runtime/src/config.rs:292` — `deep_merge_objects(&mut merged, &parsed.object)` — iterative merge, each source's values replace earlier arrays.
+     - `rust/crates/runtime/src/config.rs:790-797` — `parse_optional_permission_rules` reads `allow` / `deny` / `ask` from the MERGED object via `optional_string_array`. The lists at this point are already collapsed to the last-writer's values.
+     - `rust/crates/runtime/src/config.rs:766-772` — `parse_optional_hooks_config_object` reads `PreToolUse` / `PostToolUse` / `PostToolUseFailure` arrays from the merged object. Same last-writer-wins semantics.
+     - `rust/crates/runtime/src/config.rs:709-745` — `merge_mcp_servers` is the ONE place that merges by map-key (adding distinct server names from different layers). It is explicitly wired OUT of `deep_merge_objects` at `:293` with a separate call.
+     - `rust/crates/runtime/src/config.rs:1232-1244` — `extend_unique` and `push_unique` helpers exist and would do the right merge-by-value semantic. They are used for no config key.
+     - `grep 'extend_unique\|push_unique' rust/crates/runtime/src/config.rs` — only called from inside helper functions that don't run for allow/deny/ask/hooks. The union-merge semantic is implemented but unused on the config-merge axis.
+
+     **Why this is specifically a clawability gap.**
+     1. *Permission-bypass footgun.* A user who configures strict deny rules in their user-home config expects those rules to apply everywhere. A project-local config with a `permissions.deny` array replaces them silently. A malicious (or mistaken) `settings.local.json` with `permissions.deny: []` silently removes every deny rule the user has ever written. No warning. No diagnostic. `doctor` reports `ok`.
+     2. *Hook bypass.* Same mechanism removes security-audit hooks. A team-level `PreToolUse: ["audit.sh"]` is eliminated by a project-level `PreToolUse: ["prefill.sh"]` with no audit overlap.
+     3. *Not a defensible design choice.* The MCP server merge path at `:709` explicitly chose merge-by-key semantics for the MCP map. That implies the author knew merge-by-key was the right shape for "multiple named entries." Arrays of policy rules are semantically the same class (multiple named rules) — just without explicit keys. The design is internally inconsistent.
+     4. *Adjacent to the permission-audit cluster's existing findings.* #91 (config↔CLI parser mismatch), #94 (permission-rule validation/visibility), #101 (env-var fail-open): each of those is about permission policy being subtly wrong. #106 is about permission policy being outright erasable by a downstream config layer. Completes the permission-policy audit on the *composition* axis.
+     5. *Incompatible with team policy distribution.* The typical pattern for team security policy — "my company's default deny rules live in a distributable config that devs install into `~/.claw/settings.json`, then project-specific tweaks layer on top" — cannot work with current claw-code. The team defaults are erased by any project config that mentions the same key.
+     6. *Roadmap's own §4.1 (canonical lane event schema) and §3.5 (boot preflight)* reference "executable policy" (Product Principle #7). Policy that can be silently deleted by a downstream file is not executable — it is accidentally executable.
+
+     **Fix shape — treat policy arrays as union-merged with scope-aware deduplication; add an explicit replace-semantic opt-in.**
+     1. *Merge `permissions.allow` / `deny` / `ask` by union.* Each layer's rules extend (with dedup) rather than replace. This matches the typical team-default + project-override semantics. ~30 lines using the existing `extend_unique` helper.
+     2. *Merge `hooks.PreToolUse` / `PostToolUse` / `PostToolUseFailure` by union.* Same union semantic — multiple layers of hooks run in source-order (user first, then project, then local). ~15 lines.
+     3. *Merge `plugins.externalDirectories` by union.* Same pattern. ~5 lines.
+     4. *Allow explicit replace via a sentinel.* If a downstream layer genuinely wants to REPLACE rather than extend, accept a special form like `"deny!": [...]` (exclamation = "overwrite, don't union") or `"permissions": {"replace": ["deny"], "deny": [...]}`. Opt-in, not default. ~20 lines.
+     5. *Surface policy provenance in doctor.* For each active permission rule and hook, report which config layer contributed it. A claw or operator inspecting effective policy can trace every rule back to its source. ~30 lines. Bonus: lets #94's proposed policy visibility land the same PR.
+     6. *Emit a warning when replace-semantic opt-in is used.* At doctor-check time, if any config layer uses `!` / `replace` sentinels, surface those explicitly as overrides. Operators can audit deliberate policy erasures without hunting through files.
+     7. *Regression tests.* Per-key union merge. Explicit replace sentinel. User+project+local layering with all three setting the same array. Verify dedup.
+
+     **Acceptance.** `~/.claw/settings.json` with `deny: ["Bash(rm *)"]` and `.claw.json` with `deny: ["Bash(sudo *)"]` produces merged `deny: ["Bash(rm *)", "Bash(sudo *)"]` (union). A `.claw/settings.local.json` with `deny: []` produces merged `deny` that is the union of user + project rules — the empty array is a no-op, not an override. Operators who *want* to override add `deny!: []` explicitly. `doctor` exposes the provenance of every rule.
+
+     **Blocker.** None. `extend_unique` / `push_unique` helpers already exist. Per-key union logic is ~30 lines of additive config merge. The explicit-replace sentinel is an architectural decision (bikeshed the sigil) but the mechanism is trivial. Regression-tested fully.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdAA` on main HEAD `71e7729` in response to Clawhip pinpoint nudge at `1494827325085454407`. Joins **permission-audit / tool-allow-list** (#94, #97, #101, **#106**) — now 4-way — as the composition-axis finding. Joins **truth-audit** (#80–#87, #89, #100, #102, #103, #105) — `doctor` reports "ok" while silently having removed every deny rule a user set. Cross-cluster with **Reporting-surface / config-hygiene** (#90, #91, #92) on the "config semantics hide surprises." Natural bundle: **#94 + #106** — permission-rule validation (what each rule means) + rule composition (how rules combine). Also **#91 + #94 + #97 + #101 + #106** as the 5-way policy-surface-audit sweep after the flagship #50/#87/#91/#94/#97/#101 6-way — both bundles would close out the "the config system either misinterprets, silently drops, fails-open, or silently replaces" failure family.
