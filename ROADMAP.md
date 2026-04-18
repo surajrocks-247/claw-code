@@ -4550,3 +4550,47 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. ~25 lines across two files.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdBB2` on main HEAD `debbcbe` in response to Clawhip pinpoint nudge at `1495016073085583442`. Joins **Truth-audit / diagnostic-integrity** — `git_state: "clean"` is a lie for non-git directories. Adjacent to **#89** (claw blind to mid-rebase) — same field, different missing state. Joins **#100** (status/doctor JSON gaps) — another field whose value doesn't reflect reality. Natural bundle: **#89 + #100 + #125** — git-state-completeness triple: rebase/merge invisible (#89) + stale-base unplumbed (#100) + non-git "clean" lie (#125). Complete coverage of git_state field failures. Session tally: ROADMAP #125.
+
+126. **`/config [env|hooks|model|plugins]` ignores the section argument — all four subcommands return bit-identical output: the same config-file-list envelope `{kind:"config", files:[...], loaded_files, merged_keys, cwd}`. Help advertises "/config [env|hooks|model|plugins] — Inspect Claude config files or merged sections [resume]" — implying section-specific output. A claw invoking `/config model` expecting the resolved model config gets the file-list envelope identical to `/config hooks`. The section argument is parsed and discarded** — dogfooded 2026-04-18 on main HEAD `b56841c` from `/tmp/cdFF2`.
+
+     **Concrete repro.**
+     ```
+     $ claw --resume s --output-format json /config model | jq keys
+     ["cwd", "files", "kind", "loaded_files", "merged_keys"]
+
+     $ claw --resume s --output-format json /config hooks | jq keys
+     ["cwd", "files", "kind", "loaded_files", "merged_keys"]
+
+     $ claw --resume s --output-format json /config plugins | jq keys
+     ["cwd", "files", "kind", "loaded_files", "merged_keys"]
+
+     $ claw --resume s --output-format json /config env | jq keys
+     ["cwd", "files", "kind", "loaded_files", "merged_keys"]
+
+     $ diff <(claw --resume s --output-format json /config model) \
+            <(claw --resume s --output-format json /config hooks)
+     # empty — BIT-IDENTICAL
+
+     # Help promise:
+     $ claw --help | grep /config
+       /config [env|hooks|model|plugins]  Inspect Claude config files or merged sections [resume]
+     # "merged sections" — none shown. Same file-list for all.
+     ```
+
+     **Trace path.** `/config` handler dispatches all section arguments to the same config-file-list builder. The section argument is parsed at the slash-command level but not branched on in the handler — it produces the file-list envelope unconditionally.
+
+     **Why this is specifically a clawability gap.**
+     1. *4-way section collapse.* Same pattern as #111 (2-way) and #118 (3-way) — now 4 section arguments (env/hooks/model/plugins) that all produce identical output.
+     2. *"merged sections" promise unfulfilled.* Help says "Inspect ... merged sections." The output has `merged_keys: 0` but no merged-section content. A claw wanting to see the active hooks config or the resolved model has no JSON path.
+     3. *Joins dispatch-collapse family.* #111 + #118 + **#126** — three separate dispatch-collapse findings: 2-way (/providers → doctor), 3-way (/stats/tokens/cache → stats), 4-way (/config env/hooks/model/plugins → file-list). Complete parser-dispatch-collapse audit.
+
+     **Fix shape (~60 lines).**
+     1. Section-specific handlers: `/config model` → `{kind:"config", section:"model", resolved_model:"...", model_source:"...", aliases:{...}}`. `/config hooks` → `{kind:"config", section:"hooks", pre_tool_use:[...], post_tool_use:[...], ...}`. `/config plugins` → `{kind:"config", section:"plugins", enabled_plugins:[...]}`. `/config env` → current file-list output (already correct for env).
+     2. Bare `/config` (no section) → current file-list envelope.
+     3. Regression per section.
+
+     **Acceptance.** `/config model` returns model-specific structured data. `/config hooks` returns hooks-specific data. Each section argument produces distinct output matching its documented purpose. Bare `/config` retains current file-list behavior.
+
+     **Blocker.** None. Section branching in the handler.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdFF2` on main HEAD `b56841c` in response to Clawhip pinpoint nudge at `1495023618529300580`. Joins **Silent-flag / documented-but-unenforced** — section argument silently ignored. Joins **Truth-audit** — help promises section-specific inspection that doesn't exist. Joins **Dispatch-collapse family**: #111 (2-way) + #118 (3-way) + **#126** (4-way). Natural bundle: **#111 + #118 + #126** — dispatch-collapse trio: complete parser-dispatch-collapse audit across slash commands. Session tally: ROADMAP #126.
