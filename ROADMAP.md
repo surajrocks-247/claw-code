@@ -4084,3 +4084,122 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** Policy decisions (strict vs JSON5; alias table meanings; fallback mode when config drop happens) overlap with #86 + #87 + #115 + #116 decisions. Resolving all five together as a "permission-posture-plus-config-parsing audit" would be efficient.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdVV` on main HEAD `7859222` in response to Clawhip pinpoint nudge at `1494955670791913508`. Extends #86 (silent-drop) with novel JSON5-partial-acceptance angle + alias-collapse security inversion. Joins **Permission-audit / tool-allow-list** (#94, #97, #101, #106, #115) as 6th member — this is the CONFIG-PARSE anchor of the permission-posture problem, completing the matrix: #87 absence (no config), #101 env-var fail-OPEN, #115 init-generated dangerous default, **#120** config-drops-to-dangerous-default. Joins **Truth-audit / diagnostic-integrity** on the `loaded_config_files=0` + `permission_mode=danger-full-access` inconsistency. Joins **Reporting-surface / config-hygiene** (#90, #91, #92, #110, #115, #116) on the silent-drop-plus-no-stderr-plus-exit-0 axis. Joins **Claude Code migration parity** (#103, #109, #116, #117, #119) as 6th — claw-code is strict-where-Claude-was-lax (#116) AND lax-where-Claude-was-strict (#120). Natural bundle: **#86 + #120** — config-parse reliability pair: silent-drop general case (#86) + JSON5-partial-acceptance + alias-inversion security flip (#120). Also **permission-drift-at-every-boundary 4-way**: #87 + #101 + #115 + **#120** — absence + env-var + init-generated + config-drop. Complete coverage of how a workspace can end up at `DangerFullAccess`. Also **Jobdori+gaebal-gajae mega-bundle** ("security-critical permission drift audit"): #86 + #87 + #101 + #115 + #116 + **#120** (five-way sweep of every path to wrong permissions). Session tally: ROADMAP #120.
+
+121. **`hooks` configuration schema is INCOMPATIBLE with Claude Code. claw-code expects `{"hooks": {"PreToolUse": [<command-string>, ...]}}` — a flat array of command strings. Claude Code's schema is `{"hooks": {"PreToolUse": [{"matcher": "<tool-name>", "hooks": [{"type": "command", "command": "..."}]}]}}` — a matcher-keyed array of objects with nested command arrays. A user migrating their Claude Code `.claude.json` hooks block gets parse-fail: `field "hooks.PreToolUse" must be an array of strings, got an array (line 3)`. The error message is ALSO wrong — both schemas use arrays; the correct diagnosis is "array-of-objects where array-of-strings was expected." Separately, `claw --output-format json doctor` when failures present emits TWO concatenated JSON objects on stdout (`{kind:"doctor",...}` then `{type:"error",error:"doctor found failing checks"}`), breaking single-document parsing for any claw that does `json.load(stdout)`. Doctor output also has both `message` and `report` top-level fields containing identical prose — byte-duplicated** — dogfooded 2026-04-18 on main HEAD `b81e642` from `/tmp/cdWW`.
+
+     **Concrete repro.**
+     ```
+     # Claude Code hooks format:
+     $ cat > .claw/settings.json << 'EOF'
+     {
+       "hooks": {
+         "PreToolUse": [
+           {
+             "matcher": "Bash",
+             "hooks": [
+               {"type": "command", "command": "echo PreToolUse-test >&2"}
+             ]
+           }
+         ]
+       }
+     }
+     EOF
+
+     $ claw --output-format json status 2>&1 | head
+     {"error":"runtime config failed to load: /private/tmp/cdWW/.claw/settings.json: field \"hooks.PreToolUse\" must be an array of strings, got an array (line 3)","type":"error"}
+     # Error message: "must be an array of strings, got an array" — both are arrays.
+     # Correct diagnosis: "got an array of objects where an array of strings was expected."
+
+     # claw-code's own expected format (flat string array):
+     $ cat > .claw/settings.json << 'EOF'
+     {"hooks": {"PreToolUse": ["echo hook-invoked >&2"]}}
+     EOF
+     $ claw --output-format json status | jq .permission_mode
+     "danger-full-access"
+     # Accepted. But this is not Claude Code format.
+
+     # Claude Code canonical hooks:
+     # From Claude Code docs:
+     # {
+     #   "hooks": {
+     #     "PreToolUse": [
+     #       {
+     #         "matcher": "Bash|Write|Edit",
+     #         "hooks": [{"type": "command", "command": "./log-tool.sh"}]
+     #       }
+     #     ]
+     #   }
+     # }
+     # None of the Claude Code hook features (matcher regex, typed commands,
+     # PostToolUse/Notification/Stop event types) are supported.
+
+     # Separately: doctor NDJSON output on failures:
+     $ claw --output-format json doctor 2>&1 | python3 -c "
+     import json,sys; text=sys.stdin.read(); decoder=json.JSONDecoder()
+     idx=0; count=0
+     while idx<len(text):
+       while idx<len(text) and text[idx].isspace(): idx+=1
+       if idx>=len(text): break
+       obj,end=decoder.raw_decode(text,idx); count+=1
+       print(f'Object {count}: keys={list(obj.keys())[:5]}')
+       idx=end
+     "
+     Object 1: keys=['checks', 'has_failures', 'kind', 'message', 'report']
+     Object 2: keys=['error', 'type']
+     # Two concatenated JSON objects on stdout. python json.load() fails with
+     # "Extra data: line 133 column 1".
+
+     # Doctor message + report duplication:
+     $ claw --output-format json doctor 2>&1 | jq '.message == .report'
+     true
+     # Byte-identical prose in two top-level fields.
+     ```
+
+     **Trace path.**
+     - `rust/crates/runtime/src/config.rs:750-771` — `parse_optional_hooks_config`:
+       ```rust
+       fn parse_optional_hooks_config_object(...) -> Result<RuntimeHookConfig, ConfigError> {
+           let Some(hooks_value) = object.get("hooks") else { return Ok(...); };
+           let hooks = expect_object(hooks_value, context)?;
+           Ok(RuntimeHookConfig {
+               pre_tool_use: optional_string_array(hooks, "PreToolUse", context)?.unwrap_or_default(),
+               post_tool_use: optional_string_array(hooks, "PostToolUse", context)?.unwrap_or_default(),
+               post_tool_use_failure: optional_string_array(hooks, "PostToolUseFailure", context)?
+                   .unwrap_or_default(),
+           })
+       }
+       ```
+       `optional_string_array` expects `["cmd1", "cmd2"]`. Claude Code gives `[{"matcher": "...", "hooks": [{...}]}]`. Schema incompatible.
+     - `rust/crates/runtime/src/config.rs:775-779` — `validate_optional_hooks_config` calls the same parser; the error message "must be an array of strings" comes from `optional_string_array`'s path — but the user's actual input WAS an array (of objects). The message is technically correct but misleading.
+     - Claude Code hooks doc: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Notification`, `Stop`, `SubagentStop`, `PreCompact`, `SessionStart`. claw-code supports 3 event types. 5+ event types missing.
+     - `matcher` regex per hook (e.g. `"Bash|Write|Edit"`) — not supported.
+     - `type: "command"` vs `type: "http"` etc. (Claude Code extensibility) — not supported.
+     - `rust/crates/rusty-claude-cli/src/main.rs` doctor path — builds `DoctorReport` struct, renders BOTH a prose report AND emits it in `message` + `report` JSON fields. When failures present, appends a second `{"type":"error","error":"doctor found failing checks"}` to stdout.
+
+     **Why this is specifically a clawability gap.**
+     1. *Claude Code migration parity hard-block.* Users with existing `.claude.json` hooks cannot copy them over. Error message misleads them about what's wrong. No migration tool or adapter.
+     2. *Feature gap: no matchers, no event types beyond 3.* PreToolUse/PostToolUse/PostToolUseFailure only. Missing Notification, UserPromptSubmit, Stop, SubagentStop, PreCompact, SessionStart — all of which are documented Claude Code capabilities claws rely on.
+     3. *Error message lies about what's wrong.* "Must be an array of strings, got an array" — both are arrays. The correct message would be "expected an array of command strings, got an array of objects (Claude Code hooks format is not supported; see migration docs)."
+     4. *Doctor NDJSON output breaks JSON consumers.* `--output-format json` promises a single JSON document per the flag name. Getting NDJSON (or rather: concatenated JSON objects without line separators) breaks every `json.load(stdout)` style consumer.
+     5. *Byte-duplicated prose in `message` + `report`.* Two top-level fields with identical content. Parser ambiguity (which is the canonical source?). Byte waste.
+     6. *Joins Claude Code migration parity* (#103, #109, #116, #117, #119, #120) as 7th member — hooks is the most load-bearing Claude Code feature that doesn't work. Users who rely on hooks for workflow automation (log-tool-calls.sh, format-on-edit.sh, require-bash-approval.sh) cannot migrate.
+     7. *Joins truth-audit* — the diagnostic surface lies with a misleading error message.
+     8. *Joins silent-flag / documented-but-unenforced* — `--output-format json` says "json" not "ndjson"; violation of the flag's own semantics.
+
+     **Fix shape — extend the hooks schema to accept Claude Code format.**
+     1. *Dual-schema hooks parser.* Accept either form:
+        - claw-code native: `["cmd1", "cmd2"]`
+        - Claude Code: `[{"matcher": "pattern", "hooks": [{"type": "command", "command": "..."}]}]`
+        Translate both to the internal `RuntimeHookConfig` representation. ~80 lines.
+     2. *Add the missing event types.* Extend `RuntimeHookConfig` to include `UserPromptSubmit`, `Notification`, `Stop`, `SubagentStop`, `PreCompact`, `SessionStart`. ~50 lines.
+     3. *Implement matcher regex.* When a Claude Code-format hook includes `"matcher": "Bash|Write"`, apply the regex against the tool name before firing the hook. ~30 lines.
+     4. *Fix the error message.* Change "must be an array of strings" to "expected an array of command strings. Claude Code hooks format (matcher + typed commands) is not yet supported — see ROADMAP #121 for migration path." ~10 lines.
+     5. *Fix doctor NDJSON output.* Emit a single JSON object with `has_failures: true` + `error: "..."` fields rather than concatenating a separate error object. ~15 lines.
+     6. *De-duplicate `message` and `report`.* Pick one (`report` is more descriptive for a doctor JSON surface); drop `message`. ~5 lines.
+     7. *Regression tests.* (a) Claude Code hooks format parses and runs. (b) Native-format hooks still work. (c) Matcher regex matches correct tools. (d) All 8 event types dispatch. (e) Doctor failure emits single JSON object. (f) Doctor JSON has no duplicated fields.
+
+     **Acceptance.** A user's `.claude.json` hooks block works verbatim as `.claw.json` hooks. Error messages correctly distinguish "wrong type for array elements" from "wrong element structure." `claw --output-format json doctor` emits exactly ONE JSON document regardless of failure state. No duplicated fields.
+
+     **Blocker.** Implementation work is sizable (~200 lines + tests + migration docs). Product decision needed: full Claude Code hooks compatibility as a goal, or subset-plus-adapter. The current schema is claw-code-native; Claude Code compat requires either extending or replacing.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdWW` on main HEAD `b81e642` in response to Clawhip pinpoint nudge at `1494963222157983774`. Joins **Claude Code migration parity** (#103, #109, #116, #117, #119, #120) as 7th member — the most severe parity break since hooks is load-bearing automation infrastructure. Joins **Truth-audit / diagnostic-integrity** on misleading error message axis. Joins **Silent-flag / documented-but-unenforced** on NDJSON-output-violating-json-flag. Cross-cluster with **Unplumbed-subsystem** (#78, #96, #100, #102, #103, #107, #109, #111, #113) — hooks subsystem exists but schema is incompatible with the reference implementation. Natural bundle: **Claude Code migration parity septet (grown)**: #103 + #109 + #116 + #117 + #119 + #120 + **#121**. Complete coverage of every migration failure mode: silent drop (#103) + stderr prose warnings (#109) + hard-fail on unknown keys (#116) + prompt corruption from muscle memory (#117) + slash-verb fallthrough (#119) + JSON5-partial-accept + alias-inversion (#120) + hooks-schema-incompatible (#121). Also **#107 + #121** — hooks-subsystem pair: #107 hooks invisible to JSON diagnostics + #121 hooks schema incompatible with migration source. Also **NDJSON-violates-json-flag 2-way (new)**: #121 + probably more; worth sweep. Session tally: ROADMAP #121.
