@@ -4406,3 +4406,79 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. Localized in `rust/crates/tools/src/lib.rs:370` + status/doctor JSON plumbing.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdZZ` on main HEAD `2bf2a11` in response to Clawhip pinpoint nudge at `1494993419536306176`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118, #119, #121, #122) as 16th member — `--allowedTools` has undocumented whitespace-separator behavior, undocumented normalization asymmetry, and silent duplicate-acceptance. Joins **Permission-audit / tool-allow-list** (#94, #97, #101, #106, #115, #120) as 7th — asymmetric normalization means claw allow-lists don't round-trip cleanly between canonical representations. Joins **Truth-audit / diagnostic-integrity** — status/doctor JSON hides what the allowed-tools set actually is. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117, #122) as 9th — `--allowedTools` vs `.claw.json permissions.allow` are two entry points that likely disagree on normalization (worth separate sweep). Natural bundle: **#97 + #123** — `--allowedTools` trust-gap pair: empty silently blocks (#97) + asymmetric normalization + invisible runtime state (#123). Also **Flagship permission-audit sweep 8-way (grown)**: #50 + #87 + #91 + #94 + #97 + #101 + #115 + **#123**. Also **Permission-audit 7-way (grown)**: #94 + #97 + #101 + #106 + #115 + #120 + **#123**. Session tally: ROADMAP #123.
+
+124. **`--model` accepts any string with zero validation — typos like `sonet` silently pass through to the API where they fail late with an opaque error; empty string `""` is silently accepted as a model name; `status` JSON shows the resolved model but not the user's raw input, so post-hoc debugging of "why did my model flag not work?" requires re-reading the process argv** — dogfooded 2026-04-18 on main HEAD `bb76ec9` from `/tmp/cdAA2`.
+
+     **Concrete repro.**
+     ```
+     # Typo alias silently passed through:
+     $ claw --model sonet --output-format json status | jq .model
+     "sonet"
+     # No warning that "sonet" is not a known alias or model.
+     # At prompt time this would fail with "model not found" from the API.
+
+     # Empty string accepted:
+     $ claw --model '' --output-format json status | jq .model
+     ""
+     # Empty model string silently accepted.
+
+     # Garbage string:
+     $ claw --model 'totally-not-a-real-model-xyz123' --output-format json status | jq .model
+     "totally-not-a-real-model-xyz123"
+     # No validation. Any string accepted.
+
+     # Valid aliases do resolve:
+     $ claw --model sonnet --output-format json status | jq .model
+     "claude-sonnet-4-6"
+     $ claw --model opus --output-format json status | jq .model
+     "claude-opus-4-6"
+
+     # Config-defined aliases also resolve:
+     $ echo '{"aliases":{"my-fav":"claude-opus-4-7"}}' > .claw.json
+     $ claw --model my-fav --output-format json status | jq .model
+     "claude-opus-4-7"
+
+     # But status only shows RESOLVED name, not raw user input:
+     $ claw --model sonet --output-format json status | jq '{model, model_source: .model_source, model_raw: .model_raw}'
+     {"model":"sonet","model_source":null,"model_raw":null}
+     # No model_source or model_raw field. Claw can't distinguish
+     # "user typed exact model" vs "alias resolved" vs "default".
+     ```
+
+     **Trace path.**
+     - `rust/crates/rusty-claude-cli/src/main.rs:470-480` — `--model` arg parsing:
+       ```rust
+       "--model" => {
+           let value = args.get(index + 1).ok_or_else(|| ...)?;
+           model = value.clone();
+           index += 2;
+       }
+       ```
+       Raw string stored. No validation. No alias resolution at parse time. No check against known model list.
+     - `rust/crates/rusty-claude-cli/src/main.rs:1032-1046` — `resolve_model_alias_with_config`:
+       Resolves aliases at CliAction construction time. If the string matches a known alias (`sonnet` → `claude-sonnet-4-6`), it resolves. If not, the raw string passes through unchanged.
+     - `claw status` JSON builder at `main.rs:~4951` reports the resolved `model` field. No `model_source` (flag/config/default), no `model_raw` (pre-resolution input), no `model_valid` (whether known to any provider).
+     - At Prompt execution time (with real credentials), the model string is sent to the API. An unknown model fails with `"model not found"` or equivalent provider error. The failure is late (after system prompt assembly, context building, etc.) and carries the model ID in an API error message — not in a pre-flight check.
+
+     **Why this is specifically a clawability gap.**
+     1. *Typo → late failure.* `claw --model sonet -p "do work"` assembles the full context, sends to API, gets rejected. Billable token overhead if the provider charges for failed requests (some do). At minimum, wasted local compute for prompt assembly.
+     2. *No pre-flight check.* `claw --model unknown-model status` succeeds with exit 0. A claw preflighting with `status` cannot detect that the model is bogus until it actually makes an API call.
+     3. *Empty string accepted.* `--model ""` is a runtime bomb: the model string is empty, and the API request will fail with a confusing "model is required" or similar empty-field error.
+     4. *`status` JSON doesn't show model provenance.* A claw reading `{model: "sonet"}` can't tell if the user typed `sonet` (typo), if it's a config alias that resolved to `sonet`, or if it's the default. No `model_source: "flag"|"config"|"default"` field.
+     5. *Joins #105 (4-surface model disagreement).* #105 said `status` ignores `.claw.json` model, doctor mislabels aliases. **#124** adds: `--model` flag input isn't validated or provenance-tracked, so the model field in status is unverifiable from outside.
+     6. *Joins #122 (`--base-commit` zero validation)* — same parser pattern: flag takes any string, stores raw, no validation. `--model` and `--base-commit` are sibling unvalidated flags.
+     7. *Compare `--reasoning-effort`* at `main.rs:498-510` — validates `"low"|"medium"|"high"`. Has a guard. `--model` has none.
+     8. *Compare `--permission-mode`* — validates against known set. Has a guard. `--model` has none.
+
+     **Fix shape — validate at parse time or preflight, surface provenance.**
+     1. *Reject obviously-bad values at parse time.* Empty string: error immediately. Starts with `-`: probably swallowed flag (per #122 pattern). ~5 lines.
+     2. *Warn on unresolved aliases.* If `resolve_model_alias_with_config(input) == input` (no resolution happened) AND input doesn't look like a full model ID (no `/` for provider-prefixed, no `claude-` prefix, no `openai/` prefix), emit a structured warning: `"model '{input}' is not a known alias; it will be sent as-is to the provider. Did you mean 'sonnet'?"`. Use fuzzy match against known aliases. ~25 lines.
+     3. *Add `model_source` and `model_raw` to status JSON.* `model_source: "flag"|"config"|"default"`, `model_raw: "<what the user typed>"`, `model_resolved: "<after alias resolution>"`. A claw can verify provenance. ~15 lines.
+     4. *Add model-validity check to `doctor`.* Doctor already has an `auth` check. Add a `model` check: given the resolved model string, check if it matches known Anthropic/OpenAI model patterns. Emit `warn` if not. ~20 lines.
+     5. *Regression tests.* (a) `--model ""` → parse error. (b) `--model sonet` → structured warning with "Did you mean 'sonnet'?". (c) `--model sonnet` → resolves silently. (d) Status JSON has `model_source: "flag"` + `model_raw: "sonnet"` + `model: "claude-sonnet-4-6"`. (e) Doctor model check warns on unknown model.
+
+     **Acceptance.** `claw --model sonet status` emits a structured warning about the unresolved alias and suggests correction. `claw --model '' status` fails at parse time. Status JSON includes `model_source` and `model_raw`. Doctor includes a model-validity check.
+
+     **Blocker.** None. Localized across parse + status JSON + doctor check.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdAA2` on main HEAD `bb76ec9` in response to Clawhip pinpoint nudge at `1495000973914144819`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118, #119, #121, #122, #123) as 17th — `--model` silently accepts garbage with no validation. Joins **Truth-audit / diagnostic-integrity** — status JSON model field has no provenance. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117, #122, #123) as 10th — `--model` flag, `.claw.json model`, and the default model are three sources that disagree (#105 adjacent). Natural bundle: **#105 + #124** — model-resolution pair: 4-surface disagreement (#105) + no validation + no provenance (#124). Also **#122 + #124** — unvalidated-flag pair: `--base-commit` accepts anything (#122) + `--model` accepts anything (#124). Same parser pattern. Session tally: ROADMAP #124.
