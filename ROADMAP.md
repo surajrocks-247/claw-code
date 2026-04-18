@@ -3022,3 +3022,75 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. ~60 lines of dispatcher logic + regression tests. The levenshtein helper is 20 lines of pure arithmetic. Shorthand-prompt mode preserved for all non-near-match inputs.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdCC` on main HEAD `91c79ba` in response to Clawhip pinpoint nudge at `1494849975530815590`. Joins **silent-flag / documented-but-unenforced** (#96–#101, #104) on the subcommand-dispatch axis — sixth instance of "malformed operator input silently produces unintended behavior." Joins **parallel-entry-point asymmetry** (#91, #101, #104, #105) as another pair-axis: slash commands vs subcommands disagree on typo handling. Sibling of **#96** on the `--help` / flag-validation hygiene axis: #96 is "help advertises commands that don't work," #108 is "help doesn't advertise that subcommand typos silently become LLM prompts." Natural bundle: **#96 + #98 + #108** — three `--help`-and-dispatch-surface hygiene fixes that together remove the operator footguns in the command-parsing pipeline (help leak + flag silent-drop + subcommand typo fallthrough). Also **#91 + #101 + #104 + #105 + #108** — the full 5-way parallel-entry-point asymmetry audit.
+
+109. **Config validation emits structured diagnostics (`ConfigDiagnostic` with `path`, `field`, `line`, `kind: UnknownKey | WrongType | Deprecated`) but the loader flattens ALL warnings to prose via `eprintln!("warning: {warning}")` at `config.rs:298-300`. Deprecation notices for `permissionMode` (now `permissions.defaultMode`) and `enabledPlugins` (now `plugins.enabled`) appear only on stderr — never in the `config` check's JSON output, never as a top-level doctor `warnings` array, never surfaced in `status` JSON, never captured in any machine-readable envelope. A claw reading `--output-format json doctor` with `2>/dev/null` gets `status: "ok", summary: "runtime config loaded successfully"` even when the config uses deprecated field names. Migration-friction and truth-audit gap — the validator knows, the claw does not** — dogfooded 2026-04-18 on main HEAD `21b2773` from `/tmp/cdDD`. The `ValidationResult { errors, warnings }` struct exists; `ConfigDiagnostic` Display impl formats precisely; `DEPRECATED_FIELDS` const lists both migration paths. None of this is surfaced. `errors` (load-failing) correctly propagate into `config.status = fail` with the diagnostic string in `summary`. `warnings` (non-failing) do not.
+
+     **Concrete repro.**
+     ```
+     $ cd /tmp/cdDD && git init -q .
+     $ echo '{"enabledPlugins":{"foo":true}}' > .claw.json
+
+     $ claw --output-format json doctor 2>/tmp/stderr.log | jq '.checks[] | select(.name=="config") | {status, summary}'
+     {"status": "ok", "summary": "runtime config loaded successfully"}
+     # Config check says everything is fine
+
+     $ cat /tmp/stderr.log
+     warning: /private/tmp/cdDD/.claw.json: field "enabledPlugins" is deprecated (line 1). Use "plugins.enabled" instead
+     # The warning is on stderr — lost if you pipe to /dev/null
+
+     $ claw --output-format json doctor 2>/dev/null | jq '.checks[] | select(.name=="config")' | grep -Ei "warn|deprecated|enabledPlugins"
+     # (empty — no match)
+
+     # Compare: an ERROR-level diagnostic DOES propagate into the JSON envelope
+     $ echo '{"permisions":{"defaultMode":"read-only"}}' > .claw.json
+     $ claw --output-format json doctor 2>/dev/null | jq '.checks[] | select(.name=="config") | {status, summary}'
+     {"status": "fail", "summary": "runtime config failed to load: .claw.json: unknown key \"permisions\" (line 1). Did you mean \"permissions\"?"}
+     # Errors propagate with structured diagnostic detail; warnings do not.
+     ```
+
+     **Trace path.**
+     - `rust/crates/runtime/src/config_validate.rs:19-66` — `DiagnosticKind` enum (`UnknownKey`/`WrongType`/`Deprecated`) + `ConfigDiagnostic` struct with `path`/`field`/`line`/`kind`. Rich structured form.
+     - `rust/crates/runtime/src/config_validate.rs:68-72` — `ValidationResult { errors, warnings }`. Both are `Vec<ConfigDiagnostic>`.
+     - `rust/crates/runtime/src/config_validate.rs:313-322` — `DEPRECATED_FIELDS` const:
+       ```rust
+       DeprecatedField { name: "permissionMode", replacement: "permissions.defaultMode" },
+       DeprecatedField { name: "enabledPlugins", replacement: "plugins.enabled" },
+       ```
+     - `rust/crates/runtime/src/config_validate.rs:451` — `kind: DiagnosticKind::Deprecated { replacement }` emitted during validation for each detected deprecated field.
+     - `rust/crates/runtime/src/config.rs:285-300` — `ConfigLoader::load`:
+       ```rust
+       let validation = crate::config_validate::validate_config_file(...);
+       if !validation.is_ok() {
+           return Err(ConfigError::Parse(validation.errors[0].to_string()));
+       }
+       all_warnings.extend(validation.warnings);
+       // ... after all files ...
+       for warning in &all_warnings {
+           eprintln!("warning: {warning}");
+       }
+       ```
+       **The sole output path for warnings is `eprintln!`.** The structured `ConfigDiagnostic` is stringified and discarded; no return path, no field in `RuntimeConfig`, no accessor to retrieve the warning set after load.
+     - `rust/crates/rusty-claude-cli/src/main.rs:1701-1780` — `check_config_health` receives `config: Result<&RuntimeConfig, &ConfigError>`. There is no `config.warnings()` accessor to call because `RuntimeConfig` does not store them. The doctor check cannot surface what the loader already threw away.
+     - `grep -rn "warnings: Vec" rust/crates/runtime/src/config.rs | head` — `RuntimeConfig` has no `warnings` field. Any downstream consumer of `RuntimeConfig` is blind to the warnings by design.
+
+     **Why this is specifically a clawability gap.**
+     1. *Structured data flattened to prose and discarded.* The validator produces `ConfigDiagnostic { path, field, line, kind }` — JSON-friendly, parsing-friendly, machine-processable. The loader calls `.to_string()` and eprintln!s it, then drops the structured form. A claw gets prose it has to re-parse (or nothing, if stderr is redirected).
+     2. *Silent migration drift.* A user-home `~/.claw/settings.json` using the legacy `permissionMode` key keeps working — warning ignored, config applies — but the operator never sees the migration guidance unless they happen to notice stderr. New claw-code releases may eventually remove the legacy key; the operator has no structured way to detect their config is on the deprecation path.
+     3. *Doctor lies about config warnings.* `doctor` reports `config: ok, runtime config loaded successfully` with zero hint that the config has known issues the validator already flagged. #107 says doctor lies about hooks; #105 says status lies about model; this says doctor lies about its own config warnings.
+     4. *Parallel to #107's stderr-only hook events and #100's stderr-only stale-base warning.* Three distinct subsystems emit stderr-only prose that should be JSON events. Common shape: runtime has structured data → CLI formats to stderr → claw with `2>/dev/null` loses visibility.
+     5. *Deprecation is the natural observability test.* If the codebase knows a field is deprecated, it knows enough to surface that to operators in a structured way. Emitting to stderr and calling it done is the minimum viable level of care, not the appropriate level for a harness that wants to be clawable.
+     6. *Cross-cluster with truth-audit (#80–#87, #89, #100, #102, #103, #105, #107), unplumbed-subsystem (#78, #96, #100, #102, #103, #107), and Claude Code migration parity (#103).* Same meta-pattern as all three: structured data exists, JSON surface doesn't expose it, ecosystem migration silently breaks.
+
+     **Fix shape — store warnings on `RuntimeConfig` and surface them in doctor + status + `/config` JSON.**
+     1. *Add `warnings: Vec<ConfigDiagnostic>` field to `RuntimeConfig`.* Populate from `all_warnings` at the end of `ConfigLoader::load` before the `eprintln!` loop (keep the eprintln! for now — stderr is still useful for human operators). Add `pub fn warnings(&self) -> &[ConfigDiagnostic]` accessor. ~15 lines.
+     2. *Serialize `ConfigDiagnostic` into JSON.* Add a `to_json_value(&self) -> serde_json::Value` helper that emits `{path, field, line, kind, message, replacement?}`. ~20 lines.
+     3. *Route warnings into the `config` doctor check.* In `check_config_health`, if `runtime_config.warnings().is_empty()` → unchanged. Else promote `status` from `ok` to `warn`, and attach `warnings: [{path, field, line, kind, message, replacement?}]` to the check's JSON. ~25 lines.
+     4. *Surface warnings in status JSON too.* Add `config_warnings: [...]` or fold into a top-level `warnings` array. Claws reading `status` JSON should see the same machine-readable form. ~15 lines.
+     5. *Expose via `/config`.* `/config` slash commands currently report loaded-files + merged-keys; add a `warnings` field. ~10 lines.
+     6. *Regression tests.* One per deprecated field (`permissionMode`, `enabledPlugins`). One for multi-file warning aggregation (user + project + local each with a deprecation). One for no-warnings-case (doctor config status stays `ok`).
+
+     **Acceptance.** `claw --output-format json doctor 2>/dev/null | jq '.checks[] | select(.name=="config") | .warnings'` returns a non-empty array when the config uses `permissionMode` or `enabledPlugins`. The config check's `status` is `warn` in that case. `status` JSON exposes the same warning set. `/config` reports warnings alongside file-loaded counts.
+
+     **Blocker.** None. All additive; no breaking changes. `ValidationResult` already carries the data — this is pure plumbing from validator → loader → config type → doctor/status surface. Parallel to #107's proposed plumbing for `HookProgressEvent`.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdDD` on main HEAD `21b2773` in response to Clawhip pinpoint nudge at `1494857528335532174`. Joins **truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107) — doctor says "ok" while the validator flagged deprecations. Joins **unplumbed-subsystem** (#78, #96, #100, #102, #103, #107) — structured validator output JSON-invisible. Joins **Claude Code migration parity** (#103) — legacy claude-code-style `permissionMode` at top level is deprecated but the migration path is stderr-only. Natural bundle: **#100 + #102 + #103 + #107 + #109** — five-way doctor-surface-coverage plus structured-warnings (becomes the "doctor stops lying" PR). Also **#107 + #109** — stderr-only-prose-warning sweep (hook progress events + config warnings), same plumbing pattern, paired tiny fix. Session tally: ROADMAP #109.
