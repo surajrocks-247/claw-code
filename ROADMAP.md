@@ -3407,3 +3407,108 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. Backing `SessionStore` methods all exist (`delete_managed_session`, `fork_managed_session`, `resolve_reference`). This is dispatch-plumbing + CLI-parser wiring. Total ~130 lines + tests.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdJJ` on main HEAD `8b25daf` in response to Clawhip pinpoint nudge at `1494887723818029156`. Joins **Unplumbed-subsystem / declared-but-not-delivered** (#78, #96, #100, #102, #103, #107, #109, #111) as the ninth surface where spec advertises capability the implementation doesn't deliver on the machine-readable path. Joins **Session-handling** (#93, #112) — with #113, this cluster now covers reference-resolution semantics + concurrent-modification + programmatic management gap. Cross-cluster with **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111) on the help-vs-implementation-mismatch axis. Natural bundle: **#93 + #112 + #113** — session-handling triangle covering every axis (semantic / concurrency / management API). Also **#78 + #111 + #113** — declared-but-not-delivered triangle showing three distinct flavors: #78 fails-noisy (CLI variant → Prompt fallthrough), #111 fails-quiet (slash → wrong handler), **#113** no-handler-at-all (slash → unsupported-resumed error). Session tally: ROADMAP #113.
+
+114. **Session reference-resolution is asymmetric with `/session list`: after `/clear --confirm`, the new session_id baked into the meta header diverges from the filename (the file is renamed-in-place as `<old-id>.jsonl`). `/session list` reads the meta header and reports the NEW session_id (e.g. `session-1776481564268-1`). But `claw --resume <that-id>` looks up by FILENAME stem in `sessions_root`, not by meta-header id, and fails with `"session not found"`. Net effect: `/session list` returns session ids that the `--resume` reference resolver cannot find. Also: `/clear` backup files (`<id>.jsonl.before-clear-<ts>.bak`) are filtered out of `/session list` (zero discoverability via JSON surface), and 0-byte session files at lookup path cause `--resume` to silently construct ephemeral-never-persisted sessions with fabricated ids not in `/session list` either** — dogfooded 2026-04-18 on main HEAD `43eac4d` from `/tmp/cdNN` and `/tmp/cdOO`.
+
+     **Concrete repro.**
+     ```
+     # 1. /clear divergence — reported id is unresumable:
+     $ cd /tmp/cdNN && git init -q .
+     $ # ... seed .claw/sessions/<bucket>/ses.jsonl with meta session_id="ses" ...
+     $ claw --resume ses --output-format json /clear --confirm
+     {"kind":"clear","new_session_id":"session-1776481564268-1",...}
+
+     # File after /clear:
+     $ head -1 .claw/sessions/<bucket>/ses.jsonl
+     {"created_at_ms":..., "session_id":"session-1776481564268-1", ...}
+     #  ^^ meta says session-1776481564268-1, but filename is ses.jsonl
+
+     $ claw --resume ses --output-format json /session list
+     {"kind":"session_list","active":"session-1776481564268-1","sessions":["session-1776481564268-1"]}
+     #  /session list reports session-1776481564268-1
+
+     $ claw --resume session-1776481564268-1 --output-format json /session list
+     {"type":"error","error":"failed to restore session: session not found: session-1776481564268-1"}
+     #  But --resume by that exact id FAILS.
+
+     # 2. bak files silently filtered out:
+     $ ls .claw/sessions/<bucket>/
+     ses.jsonl    ses.jsonl.before-clear-1776481564265.bak
+     $ head -1 .claw/sessions/<bucket>/ses.jsonl.before-clear-1776481564265.bak
+     {"session_id":"ses", ...}
+     # The pre-/clear backup has the original session data with session_id "ses".
+
+     $ claw --resume latest --output-format json /session list
+     {"kind":"session_list","active":"session-1776481564268-1","sessions":["session-1776481564268-1"]}
+     # Backup is invisible. Zero discoverability via JSON surface.
+
+     # 3. 0-byte session file — ephemeral never-persisted lie:
+     $ cd /tmp/cdOO && git init -q .
+     $ mkdir -p .claw/sessions/<bucket>/ && touch .claw/sessions/<bucket>/emptyses.jsonl
+     $ claw --resume emptyses --output-format json /session list
+     {"kind":"session_list","active":"session-1776481657362-0","sessions":["session-1776481657364-1"]}
+     # Two different fabricated ids: active != sessions[0]. Neither is on disk.
+     $ find .claw -type f
+     .claw/sessions/<bucket>/emptyses.jsonl     # still 0 bytes, nothing else
+     $ claw --resume session-1776481657364-1 --output-format json /session list
+     {"type":"error","error":"failed to restore session: session not found: session-1776481657364-1"}
+     # Even the id /session list claimed exists, can't be resumed.
+     ```
+
+     **Trace path.**
+     - `rust/crates/runtime/src/session_control.rs:86-116` — `resolve_reference`:
+       ```rust
+       // After existence check:
+       Ok(SessionHandle {
+           id: session_id_from_path(&path).unwrap_or_else(|| reference.to_string()),
+           path,
+       })
+       ```
+       `handle.id` = filename stem via `session_id_from_path` (`:506`) or the raw input ref. The meta header is NEVER consulted for reference → id mapping.
+     - `rust/crates/runtime/src/session_control.rs:118-137` — `resolve_managed_path`:
+       ```rust
+       for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
+           let path = self.sessions_root.join(format!("{session_id}.{extension}"));
+           if path.exists() { return Ok(path); }
+       }
+       ```
+       Lookup key is **filename** — `{reference}.jsonl` / `{reference}.json`. Zero fallback to meta-header scan.
+     - `rust/crates/runtime/src/session_control.rs:228-285` — `collect_sessions_from_dir` (used by `/session list`):
+       ```rust
+       let summary = match Session::load_from_path(&path) {
+           Ok(session) => ManagedSessionSummary {
+               id: session.session_id,   // <-- meta-header id
+               path,
+               ...
+           },
+           Err(_) => ManagedSessionSummary {
+               id: path.file_stem()... ,  // <-- filename fallback on parse failure
+               ...
+           },
+       };
+       ```
+       When parse succeeds, `summary.id = session.session_id` (meta-header). When parse fails, `summary.id = file_stem()`. `/session list` thus reports meta-header ids for good files.
+     - `/clear` handler rewrites `session.session_id` in-place with a new timestamp-derived id (`session-{ms}-{counter}`) but writes to the same `session_path`. The file keeps its old name, gets a new id inside. **This is the source of the divergence.**
+     - `rust/crates/runtime/src/session_control.rs:264-268` — `is_managed_session_file` filters `collect_sessions_from_dir`. It excludes `.bak` files by only matching `.jsonl` and `.json` extensions. `.before-clear-{ts}.bak` becomes invisible to the JSON list surface.
+     - The 0-byte case: `Session::load_from_path` returns a parse error, falls into the `Err(_)` arm with `id: file_stem()` → but then some subsequent live-session initialization kicks in and fabricates a fresh `session-{ms}-{counter}` id without persisting. The output of `/session list` and the `active` field reflect these two different fabrications.
+
+     **Why this is specifically a clawability gap.**
+     1. *`/session list` is the claw's only JSON-surface enumeration.* A claw that discovers a session via `list` and tries to `claw --resume <that-id>` fails. The list surface and the resume surface disagree on what constitutes a session identifier.
+     2. *Joins #93 (reference-resolution semantics) with a specific, post-/clear reproduction.* #93 describes the semantics fork; #114 is a concrete path through it — `/clear` causes the filename/meta divergence, and the resume resolver never reconciles.
+     3. *Backups are un-discoverable via JSON.* A claw that wants to programmatically inspect pre-/clear session state (for recovery, audit, replay) has no JSON path to find them. It must shell out to `ls .claw/sessions/` and pattern-match `.before-clear-*.bak` by string.
+     4. *0-byte session files lie in two ways.* (a) `--resume <name>` on a 0-byte file silently fabricates a new session with a different id, never persisted. (b) `/session list` reports yet another fabricated id. Both are "phantom" sessions — references to things that cannot be subsequently resumed.
+     5. *Cross-cluster with #105 (4-surface disagreement) on a new axis.* #105 covers model-field disagreement across status/doctor/resume-header/config. #114 covers session-id disagreement across `/session list` vs `--resume`. Different fields, same shape: machine-readable surfaces emit identifiers other surfaces can't resolve.
+     6. *Joins truth-audit.* `/session list` reports `sessions: [X]`, but `claw --resume X` errors with `"session not found"`. The list surface is factually wrong about what is resumable.
+
+     **Fix shape — unify the session identifier model; make `/clear` preserve identity; surface backups.**
+     1. *Make `/clear` preserve the filename's identity.* Option A: `new_session_id = old_session_id` (just wipe content, keep id). Option B: `/clear` renames the file to match the new meta-header id AND leaves a redirect pointer (`{old-id}.jsonl → {new-id}.jsonl` symlink). Option C: `/clear` reverts to creating a totally new file with the new id, and deletes the old one. **Option A is simplest and probably correct** — `/clear` is "empty this session," not "fork to a new session id." (If fork semantics are intended, that's `/session fork`, which per #113 is REPL-only anyway.) ~20 lines.
+     2. *Make `resolve_reference` fall back to meta-header scan.* If `resolve_managed_path` fails to find `{ref}.jsonl`, enumerate directory and look for any file whose meta `session_id == ref`. ~25 lines. Covers legacy divergent files written before the fix.
+     3. *Include backup files in `/session list`.* Add an optional `--include-backups` flag OR a separate `backups: [...]` array alongside `sessions: [...]`. Parse `.bak` files, extract meta if available, report `{kind: "backup", origin_session_id, backup_timestamp, path}`. ~30 lines.
+     4. *Detect and surface 0-byte session files as `corrupt` or `empty` instead of silently fabricating a new session.* On `Session::load_from_path` seeing `len == 0`, return `SessionError::EmptySessionFile` (domain error from #112 family). `--resume` catches and reports a structured error with `retry_safe: false` + remediation hint. ~15 lines.
+     5. *Regression tests.* (a) /clear followed by `/session list` and `--resume <reported-id>` → both succeed. (b) 0-byte session file → structured error, not phantom session. (c) .bak files discoverable via list surface with explicit marker.
+
+     **Acceptance.** `claw --resume ses /clear --confirm` followed by `claw --resume session-<new>` succeeds. `/session list` never reports an id that `--resume` cannot resolve. Empty session files cause structured errors, not phantom fabrications. Backup files are enumerable via the JSON list surface.
+
+     **Blocker.** None. The fix is symmetric code-path alignment. Option A for `/clear` is a ~20-line change. Total ~90 lines + tests.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdNN` and `/tmp/cdOO` on main HEAD `43eac4d` in response to Clawhip pinpoint nudge at `1494895272936079493`. Joins **Session-handling** (#93, #112, #113) — now 4 items: reference-resolution semantics (#93), concurrent-modification (#112), programmatic management gap (#113), and reference/enumeration asymmetry (#114). Complete session-handling cluster. Joins **Truth-audit / diagnostic-integrity** on the `/session list` output being factually wrong. Cross-cluster with **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108) — #114 adds "entry points that read the same underlying data produce mutually inconsistent identifiers." Natural bundle: **#93 + #112 + #113 + #114** (session-handling quartet — complete coverage). Alternative: **#104 + #114** — /clear filename semantics + /export filename semantics both hide session identity in the filename rather than the content. Session tally: ROADMAP #114.
