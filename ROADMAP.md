@@ -3512,3 +3512,100 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. The fix is symmetric code-path alignment. Option A for `/clear` is a ~20-line change. Total ~90 lines + tests.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdNN` and `/tmp/cdOO` on main HEAD `43eac4d` in response to Clawhip pinpoint nudge at `1494895272936079493`. Joins **Session-handling** (#93, #112, #113) — now 4 items: reference-resolution semantics (#93), concurrent-modification (#112), programmatic management gap (#113), and reference/enumeration asymmetry (#114). Complete session-handling cluster. Joins **Truth-audit / diagnostic-integrity** on the `/session list` output being factually wrong. Cross-cluster with **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108) — #114 adds "entry points that read the same underlying data produce mutually inconsistent identifiers." Natural bundle: **#93 + #112 + #113 + #114** (session-handling quartet — complete coverage). Alternative: **#104 + #114** — /clear filename semantics + /export filename semantics both hide session identity in the filename rather than the content. Session tally: ROADMAP #114.
+
+115. **`claw init` generates `.claw.json` with `"permissions": {"defaultMode": "dontAsk"}` — where "dontAsk" is an alias for `danger-full-access`, hardcoded in `rust/crates/runtime/src/config.rs:858`. The init output is prose-only with zero mention of "danger", "permission", or "access" — a claw (or human) running `claw init` in a fresh project gets no signal that the generated config turns permissions off. `claw init --output-format json` returns `{kind: "init", message: "<multi-line prose with \n literals>"}` instead of structured `{files_created: [...], defaultMode: "dontAsk", security_posture: "danger-full-access"}`. The alias choice itself ("dontAsk") obscures the behavior: a user seeing `"defaultMode": "dontAsk"` in their new repo naturally reads it as "don't ask me to confirm" — NOT "grant every tool every permission unconditionally" — but the two are identical per the parser at `config.rs:858`. `claw init` is effectively a silent bootstrap to maximum-permissions mode** — dogfooded 2026-04-18 on main HEAD `ca09b6b` from `/tmp/cdPP`.
+
+     **Concrete repro.**
+     ```
+     $ cd /tmp/cdPP && git init -q .
+     $ claw init
+     Init
+       Project          /private/tmp/cdPP
+       .claw/           created
+       .claw.json       created
+       .gitignore       created
+       CLAUDE.md        created
+       Next step        Review and tailor the generated guidance
+     # No mention of security posture, permission mode, or "danger".
+
+     $ claw init --output-format json
+     # Actually: claw init produces its own structured output:
+     {
+       "kind": "init",
+       "message": "Init\n  Project          /private/tmp/cdPP\n  .claw/           created\n  .claw.json       created\n..."
+     }
+     # The entire init report is a \n-embedded prose blob inside `message`.
+
+     $ cat .claw.json
+     {
+       "permissions": {
+         "defaultMode": "dontAsk"
+       }
+     }
+
+     $ claw status --output-format json | python3 -c "import json,sys; d=json.load(sys.stdin); print('permission_mode:', d['permission_mode'])"
+     permission_mode: danger-full-access
+     # "dontAsk" in .claw.json resolves to danger-full-access at load time.
+
+     $ claw init 2>&1 | grep -iE "danger|permission|access"
+     (nothing)
+     # Zero warning anywhere in the init output.
+     ```
+
+     **Trace path.**
+     - `rust/crates/rusty-claude-cli/src/init.rs:4-9` — `STARTER_CLAW_JSON` constant:
+       ```rust
+       const STARTER_CLAW_JSON: &str = concat!(
+           "{\n",
+           "  \"permissions\": {\n",
+           "    \"defaultMode\": \"dontAsk\"\n",
+           "  }\n",
+           "}\n",
+       );
+       ```
+       Hardcoded dangerous default. No audit hook. No template choice. No "safe by default" option.
+     - `rust/crates/runtime/src/config.rs:858` — alias resolution:
+       ```rust
+       "dontAsk" | "danger-full-access" => Ok(ResolvedPermissionMode::DangerFullAccess),
+       ```
+       "dontAsk" is semantically identical to "danger-full-access." The alias is the fig leaf; the effect is identical.
+     - `rust/crates/rusty-claude-cli/src/init.rs:370` — the JSON-output path also emits `"defaultMode": "dontAsk"` literally. Prose path and JSON path agree on the payload; both produce the dangerous default.
+     - `rust/crates/rusty-claude-cli/src/init.rs` init runner — returns `InitReport` that becomes `{kind: "init", message: "<multi-line prose>"}`. No `files_created: [...]`, no `resolved_permission_mode`, no `security_posture` field.
+     - `grep -rn "dontAsk" rust/crates/` — only four matches: `tools/src/lib.rs:5677` (option enumeration for a help string), `runtime/src/config.rs:858` (alias resolution), and two entries in `rusty-claude-cli/src/init.rs`. No UI string anywhere explains that dontAsk equals danger-full-access.
+
+     **Why this is specifically a clawability gap.**
+     1. *Silent security-posture drift at bootstrap.* A claw (or a user) running `claw init` in a fresh repo gets handed an unconditionally-permissive workspace with no in-band signal. The only way to learn the security posture is to read the config file yourself and cross-reference it against the parser's alias table.
+     2. *Alias naming conceals severity.* `dontAsk` is a user-friendly phrase that reads as "skip the confirmations I would otherwise see." It hides what's actually happening: *every tool unconditionally approved, no audit trail, no sandbox*. If the literal key were `"danger-full-access"`, users would recognize what they're signing up for. The alias dilutes the warning.
+     3. *Init is the onboarding moment.* Whatever `init` generates is what users paste into git, commit, share with colleagues, and inherit across branches. A dangerous default here propagates through every downstream workspace.
+     4. *JSON output is prose-wrapped.* `claw init --output-format json` returns `{kind: "init", message: "<prose with \n>"}`. A claw orchestrating project setup must string-parse `"` `\n" "separated lines"` to learn what got created. No `files_created: [...]`, no `resolved_permission_mode`, no `security_posture`. This joins #107 / #109 (structured-data-crammed-into-a-prose-field) as yet another machine-readable surface that regresses on structure.
+     5. *Builds on #87 and amplifies it.* #87 identified that a workspace with no config silently defaults to danger-full-access. #115 identifies that `claw init` actively GENERATES a config that keeps that default, and obscures the name ("dontAsk"), and surfaces it via a prose-only init report. Three compounding failures on the same axis.
+     6. *Joins truth-audit.* The init report says "Next step: Review and tailor the generated guidance" — implying there is something to tailor that is not a trap. A truthful message would say "`claw init` configured permissions.defaultMode = 'dontAsk' (alias for danger-full-access). This grants all tools unconditional access. Consider changing to 'default' or 'plan' for stricter prompting."
+     7. *Joins silent-flag / documented-but-unenforced cluster.* Help / docs do not clarify that "dontAsk" is a rename of "danger-full-access." The mode string is user-facing; its effect is not.
+
+     **Fix shape — change the default, expose the resolution, structure the JSON.**
+     1. *Change `STARTER_CLAW_JSON` default.* Options: (a) `"defaultMode": "default"` (prompt for destructive actions). (b) `"defaultMode": "plan"` (plan-first). (c) Leave permissions block out entirely and fall back to whatever the unconfigured-default should be (currently #87's gap). **Recommendation: (a) — explicit safe default. Users who WANT danger-full-access can opt in.** ~5-line change.
+     2. *Warn in init output when the generated config implies elevated permissions.* If the effective mode resolves to `DangerFullAccess`, the init summary should include a one-line security annotation: `security: danger-full-access (unconditional tool approval). Change .claw.json permissions.defaultMode to 'default' to require prompting.` ~15 lines.
+     3. *Structure the init JSON output.* Replace the prose `message` field with:
+        ```json
+        {
+          "kind": "init",
+          "files": [
+            {"path": ".claw/", "action": "created"},
+            {"path": ".claw.json", "action": "created"},
+            {"path": ".gitignore", "action": "created"},
+            {"path": "CLAUDE.md", "action": "created"}
+          ],
+          "resolved_permission_mode": "danger-full-access",
+          "permission_mode_source": "init-default",
+          "security_warnings": ["permission mode resolves to danger-full-access via 'dontAsk' alias"]
+        }
+        ```
+        Claws can consume this directly. Keep a `message` field for the prose, but sole source of truth for structure is the fields. ~30 lines.
+     4. *Deprecate the "dontAsk" alias OR add an explicit audit-log when it resolves.* Either remove the alias entirely (callers pick the literal `"danger-full-access"`) or log a warning at parse time: `permission mode "dontAsk" is an alias for "danger-full-access"; grants unconditional tool access`. ~8 lines.
+     5. *Regression test.* `claw init` followed by `claw status --output-format json` where the test expects either `permission_mode != danger-full-access` (after changing default) OR the init output includes a visible security warning (if the dangerous default is kept).
+
+     **Acceptance.** `claw init` in a fresh repo no longer silently configures `danger-full-access`. Either (a) the default is safe, or (b) if the dangerous default remains, the init output — both prose and JSON — carries an explicit `security_warnings: [...]` field that a claw can parse. The alias "dontAsk" either becomes a warning at parse time or resolves to a safer mode.
+
+     **Blocker.** Product decision: is `init`-default `danger-full-access` intentional (for low-friction onboarding) or accidental? If intentional, the fix is warning-only. If accidental, the fix is a safer default.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdPP` on main HEAD `ca09b6b` in response to Clawhip pinpoint nudge at `1494917922076889139`. Joins **Permission-audit / tool-allow-list** (#94, #97, #101, #106) as 5th member — this is the init-time ANCHOR of the permission-posture problem: #87 is absence-of-config, #101 is fail-OPEN on bad env var, **#115** is the init-generated dangerous default. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111) on the third axis: not a silent flag, but a silent setting (the generated config's security implications are silent in the init output). Cross-cluster with **Reporting-surface / config-hygiene** (#90, #91, #92, #110) on the structured-data-vs-prose axis: `claw init --output-format json` wraps all structure inside `message`. Cross-cluster with **Truth-audit** on "Next step: Review and tailor the generated guidance" phrasing — misleads by omission. Natural bundle: **#87 + #101 + #115** — "permission drift at every boundary": absence default + env-var bypass + init-generated default. Also: **#50 + #87 + #91 + #94 + #97 + #101 + #115** — flagship permission-audit sweep now 7-way. Session tally: ROADMAP #115.
