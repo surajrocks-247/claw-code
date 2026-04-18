@@ -4290,3 +4290,119 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. Parser refactor is localized.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdYY` on main HEAD `d1608ae` in response to Clawhip pinpoint nudge at `1494978319920136232`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118, #119, #121) as 15th — `--base-commit` silently accepts garbage values. Joins **Parser-level trust gaps** via quartet → quintet: #108 (typo → Prompt), #117 (`-p` greedy), #119 (slash-verb + arg → Prompt), **#122** (`--base-commit` greedy consumes subcommand/flag). All four are parser-level "too eager" bugs. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117) as 8th — stale-base check is implemented for Prompt path but absent from Status/Doctor surfaces. Joins **Truth-audit / diagnostic-integrity** — warning message "expected base commit (doctor)" lies by including user's mistake as truth. Cross-cluster with **Unplumbed-subsystem** (#78, #96, #100, #102, #103, #107, #109, #111, #113, #121) — stale-base signal exists in runtime but not in JSON. Natural bundle: **Parser-level trust gap quintet (grown)**: #108 + #117 + #119 + #122 — billable-token silent-burn via parser too-eager consumption. Also **#100 + #122**: stale-base unplumbed (Jobdori #100) + `--base-commit` flag accepts anything (Jobdori #122). Complete stale-base-diagnostic-integrity coverage. Session tally: ROADMAP #122.
+
+123. **`--allowedTools` tool name normalization is asymmetric: `normalize_tool_name` converts `-` → `_` and lowercases, but canonical names aren't normalized the same way, so tools with snake_case canonical (`read_file`) accept underscore + hyphen + lowercase variants (`read_file`, `READ_FILE`, `Read-File`, `read-file`, plus aliases `read`/`Read`), while tools with PascalCase canonical (`WebFetch`) REJECT snake_case variants (`web_fetch`, `web-fetch` both fail). A user or claw defensively writing `--allowedTools WebFetch,web_fetch` gets half the tools accepted and half rejected. The acceptance list mixes conventions: `bash`, `read_file`, `write_file` are snake_case; `WebFetch`, `WebSearch`, `TodoWrite`, `Skill`, `Agent` are PascalCase. Help doesn't explain which convention to use when. Separately: `--allowedTools` splits on BOTH commas AND whitespace (`Bash  Read` parses as two tools), duplicate/case-variant tokens like `bash,Bash,BASH` are silently accepted with no dedup warning, and the allowed-tool set is NOT surfaced in `status` / `doctor` JSON output — a claw invoking with `--allowedTools` has no post-hoc way to verify what the runtime actually accepted** — dogfooded 2026-04-18 on main HEAD `2bf2a11` from `/tmp/cdZZ`.
+
+     **Concrete repro.**
+     ```
+     # Full tool-name matrix — same conceptual tool, different spellings:
+
+     # For canonical "bash":
+     $ claw --allowedTools Bash status --output-format json | head -1
+     { ... accepted
+     $ claw --allowedTools bash status --output-format json | head -1
+     { ... accepted (case-insensitive)
+     $ claw --allowedTools BASH status --output-format json | head -1
+     { ... accepted
+
+     # For canonical "read_file" (snake_case):
+     $ claw --allowedTools read_file status --output-format json | head -1
+     { ... accepted (exact)
+     $ claw --allowedTools READ_FILE status | head -1
+     { ... accepted (case-insensitive)
+     $ claw --allowedTools Read-File status | head -1
+     { ... accepted (hyphen → underscore normalization)
+     $ claw --allowedTools Read status | head -1
+     { ... accepted (alias "read" → "read_file")
+     $ claw --allowedTools ReadFile status | head -1
+     {"error":"unsupported tool in --allowedTools: ReadFile"}   # REJECTED
+
+     # For canonical "WebFetch" (PascalCase):
+     $ claw --allowedTools WebFetch status | head -1
+     { ... accepted (exact)
+     $ claw --allowedTools webfetch status | head -1
+     { ... accepted (case-insensitive)
+     $ claw --allowedTools WEBFETCH status | head -1
+     { ... accepted
+     $ claw --allowedTools web_fetch status | head -1
+     {"error":"unsupported tool in --allowedTools: web_fetch"}   # REJECTED
+     $ claw --allowedTools web-fetch status | head -1
+     {"error":"unsupported tool in --allowedTools: web-fetch"}   # REJECTED
+
+     # Separators: comma OR whitespace both work:
+     $ claw --allowedTools 'Bash,Read' status | head -1        # comma
+     { ...
+     $ claw --allowedTools 'Bash Read' status | head -1        # whitespace
+     { ...
+     $ claw --allowedTools 'Bash    Read' status | head -1     # multiple whitespace
+     { ...
+     # Documentation says: `--allowedTools TOOL[,TOOL...]`. Whitespace split is not documented.
+
+     # Duplicate/case-variant tokens silently accepted:
+     $ claw --allowedTools 'bash,Bash,BASH' status | head -1
+     { ...                                                      # no dedup warning
+
+     # Allowed-tools NOT in status JSON:
+     $ claw --allowedTools Bash --output-format json status | jq 'keys'
+     ["kind","model","permission_mode","sandbox","usage","workspace"]
+     # No "allowed_tools" field. No way to verify what the runtime is honoring.
+     ```
+
+     **Trace path.**
+     - `rust/crates/tools/src/lib.rs:192-244` — `normalize_allowed_tools`:
+       ```rust
+       let builtin_specs = mvp_tool_specs();
+       let canonical_names = builtin_specs.iter().map(|spec| spec.name.to_string())
+           .chain(self.plugin_tools.iter().map(|tool| tool.definition().name.clone()))
+           .chain(self.runtime_tools.iter().map(|tool| tool.name.clone()))
+           .collect::<Vec<_>>();
+       let mut name_map = canonical_names.iter()
+           .map(|name| (normalize_tool_name(name), name.clone()))
+           .collect::<BTreeMap<_, _>>();
+       for (alias, canonical) in [
+           ("read", "read_file"),
+           ("write", "write_file"),
+           ("edit", "edit_file"),
+           ("glob", "glob_search"),
+           ("grep", "grep_search"),
+       ] {
+           name_map.insert(alias.to_string(), canonical.to_string());
+       }
+       // ... split + lookup ...
+       for token in value.split(|ch: char| ch == ',' || ch.is_whitespace())...
+       ```
+     - `rust/crates/tools/src/lib.rs:370-372` — `normalize_tool_name`:
+       ```rust
+       fn normalize_tool_name(value: &str) -> String {
+           value.trim().replace('-', "_").to_ascii_lowercase()
+       }
+       ```
+       Lowercases + replaces `-` with `_`. But **does NOT remove underscores**, so input with underscores retains them.
+     - **The asymmetry**: For canonical name `WebFetch`, `normalize_tool_name("WebFetch")` = `"webfetch"` (no underscore). For user input `web_fetch`, `normalize_tool_name("web_fetch")` = `"web_fetch"` (underscore preserved). These don't match in `name_map`.
+     - For canonical `read_file`, `normalize_tool_name("read_file")` = `"read_file"`. User input `Read-File` → `"read_file"`. These match.
+     - So snake_case canonical names tolerate hyphen/underscore/case variants; PascalCase canonical names reject any form with underscores.
+     - `--allowedTools` value NOT plumbed into `CliAction::Status` or `ResumeCommandOutcome` for `/status` — no `allowed_tools` or `allowedTools` field in the JSON output.
+
+     **Why this is specifically a clawability gap.**
+     1. *Asymmetric normalization creates unpredictable acceptance.* A claw defensively normalizing to snake_case (a common Rust/Python convention) gets half its tools accepted. A claw using PascalCase gets the other half.
+     2. *Help doesn't document the convention.* `--help` shows just `--allowedTools TOOL[,TOOL...]` without explaining that internal tool names mix conventions, or that hyphen-to-underscore normalization exists for some but not all.
+     3. *Whitespace-as-separator is undocumented.* Help says `TOOL[,TOOL...]` — commas only. Implementation accepts whitespace. A claw piping through `tr ',' ' '` to strip commas gets the same effect silently.
+     4. *Duplicate-with-case-variants silently accepted.* `bash,Bash,BASH` all normalize to the same canonical but produce no warning. A claw programmatically generating tool lists can bloat its input with case variants without the runtime pushing back.
+     5. *Allowed-tools not surfaced in status/doctor JSON.* Pass `--allowedTools Bash` and `status` gives no indication that only Bash is allowed. A claw preflighting a run cannot verify the runtime's view of what's allowed.
+     6. *Joins #97 (--allowedTools empty-string silently blocks all).* Same flag, different axis of silent-acceptance-without-surface-feedback. #97 + #123 are both trust-gap failures for the same surface.
+     7. *Joins parallel-entry-point asymmetry.* `.claw.json permissions.allow` vs `--allowedTools` flag — do they accept the same normalization? Worth separate sweep. If yes, the inconsistency is user-invisible in both; if no, users have to remember two separate conventions.
+     8. *Joins silent-flag / documented-but-unenforced.* Convention isn't documented; whitespace-separator isn't documented; duplicate tolerance isn't documented.
+
+     **Fix shape — symmetric normalization + surface to JSON + document.**
+     1. *Symmetric normalization.* Either (a) strip underscores from both canonical and input: `normalize_tool_name` = `trim + lowercase + replace('-|_', "")`, making `web_fetch`, `web-fetch`, `webfetch`, `WebFetch` all equivalent; or (b) don't normalize hyphens-to-underscores in the input either, so only exact-case-insensitive match works. Pick one. ~5 lines.
+     2. *Document the canonical name list.* Add a `claw tools list` or `--allowedTools help` subcommand that prints the canonical names + accepted variants. ~20 lines.
+     3. *Surface allowed_tools in status/doctor JSON.* Add top-level `allowed_tools: [...]` field when `--allowedTools` is provided. ~10 lines.
+     4. *Document the comma+whitespace split semantics.* Update `--help` to say `TOOL[,TOOL...|TOOL TOOL...]` or pick one convention. ~3 lines.
+     5. *Warn on duplicate tokens.* If normalize-map deduplicates 3 → 1 silently, emit structured warning. ~8 lines.
+     6. *Regression tests.* (a) Symmetric normalization matrix: every (canonical, variant) pair accepts or rejects consistently. (b) Status JSON includes allowed_tools when flag set. (c) Duplicate-token warning.
+
+     **Acceptance.** `--allowedTools WebFetch` and `--allowedTools web_fetch` both accept/reject the same way. `claw status --output-format json` with `--allowedTools Bash` shows `allowed_tools: ["bash"]` in the JSON. `--help` documents the separator and normalization rules.
+
+     **Blocker.** None. Localized in `rust/crates/tools/src/lib.rs:370` + status/doctor JSON plumbing.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdZZ` on main HEAD `2bf2a11` in response to Clawhip pinpoint nudge at `1494993419536306176`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118, #119, #121, #122) as 16th member — `--allowedTools` has undocumented whitespace-separator behavior, undocumented normalization asymmetry, and silent duplicate-acceptance. Joins **Permission-audit / tool-allow-list** (#94, #97, #101, #106, #115, #120) as 7th — asymmetric normalization means claw allow-lists don't round-trip cleanly between canonical representations. Joins **Truth-audit / diagnostic-integrity** — status/doctor JSON hides what the allowed-tools set actually is. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117, #122) as 9th — `--allowedTools` vs `.claw.json permissions.allow` are two entry points that likely disagree on normalization (worth separate sweep). Natural bundle: **#97 + #123** — `--allowedTools` trust-gap pair: empty silently blocks (#97) + asymmetric normalization + invisible runtime state (#123). Also **Flagship permission-audit sweep 8-way (grown)**: #50 + #87 + #91 + #94 + #97 + #101 + #115 + **#123**. Also **Permission-audit 7-way (grown)**: #94 + #97 + #101 + #106 + #115 + #120 + **#123**. Session tally: ROADMAP #123.
