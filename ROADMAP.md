@@ -3800,3 +3800,85 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. Parser refactor is localized to one arm. Compatibility concern: anyone currently relying on `-p` greedy absorption (unlikely because it's silently-broken) would see a behavior change. Deprecation warning for one release softens the transition.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdSS` on main HEAD `f2d6538` in response to Clawhip pinpoint nudge at `1494933025857736836`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116) as 12th member — `-p` is an undocumented-in-`--help` shortcut whose silent greedy behavior makes flag-order semantics invisible. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114) as 7th — three entry points (`claw prompt TEXT`, bare positional `claw TEXT`, `claw -p TEXT`) with subtly different arg-parsing semantics. Joins **Truth-audit** — the parser is lying about what it parsed when `-p` is present. Joins **Claude Code migration parity** (#103, #109, #116) as 4th — users migrating `claude -p "..." --model ..."` silently get corrupted prompts. Cross-cluster with **Silent-flag** quartet (#96, #98, #108, #111) now quintet: #108 (subcommand typos fall through to Prompt, burning billed tokens) + **#117** (prompt flags swallowed into prompt text, ALSO burning billed tokens) — both are silent-token-burn failure modes. Natural bundle: **#108 + #117** — billable-token silent-burn pair: typo fallthrough + flag-swallow. Also **#105 + #108 + #117** — model-resolution triangle: `claw status` ignores .claw.json model (#105) + typo'd `claw statuss` burns tokens (#108) + `-p "test" --model sonnet` silently ignores the model (#117). Session tally: ROADMAP #117.
+
+118. **Three slash commands — `/stats`, `/tokens`, and `/cache` — all collapse to `SlashCommand::Stats` at `commands/src/lib.rs:1405` (`"stats" | "tokens" | "cache" => SlashCommand::Stats`), returning bit-identical output (`{"kind":"stats", ...}`) despite `--help` advertising three distinct capabilities: `/stats` = "Show workspace and session statistics", `/tokens` = "Show token count for the current conversation", `/cache` = "Show prompt cache statistics". A claw invoking `/cache` expecting cache-focused output gets a grab-bag that says `kind: "stats"` — not even `kind: "cache"`. A claw invoking `/tokens` expecting a focused token report gets the same grab-bag labeled `kind: "stats"`. This is the 2-dimensional-superset of #111 (2-way dispatch collapse) — #118 is a 3-way collapse where each collapsed alias has a DIFFERENT help description, compounding the documentation-vs-implementation gap** — dogfooded 2026-04-18 on main HEAD `b9331ae` from `/tmp/cdTT`.
+
+     **Concrete repro.**
+     ```
+     # Three distinct help lines:
+     $ claw --help | grep -E "^\s*/(stats|tokens|cache)\s"
+       /stats   Show workspace and session statistics [resume]
+       /tokens  Show token count for the current conversation [resume]
+       /cache   Show prompt cache statistics [resume]
+
+     # All three return identical output with kind: "stats":
+     $ claw --resume s --output-format json /stats
+     {"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":0,"kind":"stats","output_tokens":0,"total_tokens":0}
+
+     $ claw --resume s --output-format json /tokens
+     {"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":0,"kind":"stats","output_tokens":0,"total_tokens":0}
+
+     $ claw --resume s --output-format json /cache
+     {"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":0,"kind":"stats","output_tokens":0,"total_tokens":0}
+
+     # diff /stats vs /tokens → identical
+     # diff /stats vs /cache → identical
+     # kind field is always "stats", never "tokens" or "cache"
+     ```
+
+     **Trace path.**
+     - `rust/crates/commands/src/lib.rs:1405-1408` — the 3-way collapse:
+       ```rust
+       "stats" | "tokens" | "cache" => {
+           validate_no_args(command, &args)?;
+           SlashCommand::Stats
+       }
+       ```
+       Parser accepts all three verbs, produces identical enum variant. No `SlashCommand::Tokens` or `SlashCommand::Cache` exists.
+     - `rust/crates/rusty-claude-cli/src/main.rs:2872-2879` — the Stats handler:
+       ```rust
+       SlashCommand::Stats => {
+           ...
+           "kind": "stats",
+           ...
+       }
+       ```
+       Hard-codes `"kind": "stats"` regardless of which user-facing alias was invoked. A claw cannot tell from the output whether the user asked for `/stats`, `/tokens`, or `/cache`.
+     - `rust/crates/commands/src/lib.rs:317` — `SlashCommandSpec{ name: "stats", ... }` registered. One entry.
+     - `rust/crates/commands/src/lib.rs:702` — `SlashCommandSpec{ name: "tokens", ... }` registered. Separate entry with distinct `summary` and `description`.
+     - `rust/crates/commands/src/lib.rs` — `/cache` similarly gets its own `SlashCommandSpec` with distinct docs.
+     - So: three spec entries (each with unique help text) → one parser arm (collapse) → one handler (`SlashCommand::Stats`) → one output (`kind: "stats"`). Four surfaces, three aliases, one actual capability.
+
+     **Why this is specifically a clawability gap.**
+     1. *Help advertises three distinct capabilities that don't exist.* A claw that parses `--help` to discover capabilities learns there are three token-and-cache-adjacent commands with different scopes. The implementation betrays that discovery.
+     2. *`kind` field never reflects the user's invocation.* A claw programmatically distinguishing "stats" events from "tokens" events from "cache" events can't — they're all `kind: "stats"`. This is a type-loss in the telemetry/event layer: a consumer cannot switch on `kind`.
+     3. *More severe than #111.* #111 was `/providers` → `SlashCommand::Doctor` (2 aliases → 1 handler, wildly different advertised purposes). #118 is 3 aliases → 1 handler, THREE distinct advertised purposes (workspace statistics, conversation tokens, prompt cache). 3-way collapse with 3-way doc mismatch.
+     4. *The collapse loses information that IS available.* `Stats` output contains `cache_creation_input_tokens` and `cache_read_input_tokens` as top-level fields — so the cache-focused data IS present. But `/cache` should probably return `{kind: "cache", cache_hits: X, cache_misses: Y, hit_rate: Z%, ...}` — a cache-specific schema. Similarly `/tokens` should probably return `{kind: "tokens", conversation_total: N, turns: M, average_per_turn: ...}` — a turn-focused schema. Implementation returns the union instead.
+     5. *Joins truth-audit.* Three distinct promises in `--help`; one implementation underneath. The help text is true for `/stats` but misleading for `/tokens` and `/cache`.
+     6. *Joins silent-flag / documented-but-unenforced.* Help documents `/cache` as a distinct capability. Implementation silently substitutes. No warning, no error, no deprecation note.
+     7. *Pairs with #111.* `/providers` → `Doctor`. `/tokens` + `/cache` → `Stats`. Both are dispatch collapses where parser accepts multiple distinct surface verbs and collapses them to a single incorrect handler. The `commands/src/lib.rs` parser has at least two such collapse arms; likely more elsewhere (needs sweep).
+
+     **Fix shape — introduce separate SlashCommand variants, separate handlers, separate output schemas.**
+     1. *Add `SlashCommand::Tokens` and `SlashCommand::Cache` enum variants.* ~10 lines.
+     2. *Parser arms.* `"tokens" => SlashCommand::Tokens`, `"cache" => SlashCommand::Cache`. Keep `"stats" => SlashCommand::Stats`. ~8 lines.
+     3. *Handlers with distinct output schemas.*
+        ```json
+        // /tokens
+        {"kind":"tokens","conversation_total":N,"input_tokens":I,"output_tokens":O,"turns":T,"average_per_turn":A}
+
+        // /cache
+        {"kind":"cache","cache_creation_input_tokens":C,"cache_read_input_tokens":R,"cache_hits":H,"cache_misses":M,"hit_rate_pct":P}
+
+        // /stats (existing, possibly add a `subsystem` field for consistency)
+        {"kind":"stats","subsystem":"all","input_tokens":I,"output_tokens":O,"cache_creation_input_tokens":C,"cache_read_input_tokens":R,...}
+        ```
+        ~50 lines of handler impls.
+     4. *Regression test per alias: `kind` matches invocation; schema matches advertised purpose.* ~20 lines.
+     5. *Sweep parser for other collapse arms.* `grep -E '"\w+" \| "\w+"' rust/crates/commands/src/lib.rs` to find all multi-alias arms. Validate each against help docs. (Already found: `#111` = doctor|providers; `#118` = stats|tokens|cache. Likely more.) ~5-10 remediations if more found.
+     6. *Documentation: if aliasing IS intentional, annotate `--help` so users know `/tokens` is literally `/stats`.* E.g. `/tokens (alias for /stats)`. ~5 lines.
+
+     **Acceptance.** `/stats` returns `kind: "stats"`. `/tokens` returns `kind: "tokens"` with a conversation-token-focused schema. `/cache` returns `kind: "cache"` with a prompt-cache-focused schema. `--help` either lists the three as distinct capabilities and each delivers, OR explicitly marks aliases. Parser collapse arms are audited across `commands/src/lib.rs`; any collapse that loses information is fixed.
+
+     **Blocker.** Product decision: is the 3-way collapse intentional (one command, three synonyms) or accidental (three commands, one implementation)? Help docs suggest the latter. Either path is fine, as long as behavior matches documentation.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdTT` on main HEAD `b9331ae` in response to Clawhip pinpoint nudge at `1494940571385593958`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117) as 13th member — more severe than #111 (3-way collapse vs 2-way). Joins **Truth-audit / diagnostic-integrity** on the help-vs-implementation-mismatch axis. Cross-cluster with **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117) on the "multiple surfaces with distinct-advertised-but-identical-implemented behavior" axis. Natural bundle: **#111 + #118** — dispatch-collapse pair: `/providers` → `Doctor` (2-way) + `/stats`+`/tokens`+`/cache` → `Stats` (3-way). Complete parser-dispatch audit shape. Also **#108 + #111 + #118** — parser-level trust gaps: typo fallthrough (#108) + 2-way collapse (#111) + 3-way collapse (#118). Session tally: ROADMAP #118.
