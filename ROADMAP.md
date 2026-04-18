@@ -3981,3 +3981,106 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. The fix is a localized parser change (`main.rs:745-763`). Downstream tests are additive.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdUU` on main HEAD `3848ea6` in response to Clawhip pinpoint nudge at `1494948121099243550`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118) as 14th member — the fall-through to Prompt is silent. Joins **Claude Code migration parity** (#103, #109, #116, #117) as 5th member — users coming from Claude Code muscle-memory for `claude <verb> --help` get silently billed. Joins **Truth-audit / diagnostic-integrity** — the CLI claims "missing credentials" but the true cause is "your CLI invocation was interpreted as a chat prompt." Cross-cluster with **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117) — another entry point (slash-verb + args) that differs from the same verb bare. Natural bundle: **#108 + #117 + #119** — billable-token silent-burn triangle: typo fallthrough (#108) + flag swallow (#117) + known-slash-verb-with-args fallthrough (#119). All three are silent-money-burn failure modes with the same underlying cause: too-narrow parser detection + greedy Prompt dispatch. Also **#108 + #111 + #118 + #119** — parser-level trust gap quartet: typo fallthrough (#108) + 2-way slash collapse (#111) + 3-way slash collapse (#118) + known-slash-verb fallthrough (#119). Session tally: ROADMAP #119.
+
+120. **`.claw.json` is parsed by a custom JSON-ish parser (`JsonValue::parse` in `rust/crates/runtime/src/json.rs`) that accepts trailing commas (one), but silently drops files containing line comments, block comments, unquoted keys, UTF-8 BOM, single quotes, hex numbers, leading commas, or multiple trailing commas. The user sees `.claw.json` behave partially like JSON5 (trailing comma works) and reasonably assumes JSON5 tolerance. Comments or unquoted keys — the two most common JSON5 conveniences a developer would reach for — silently cause the entire config to be dropped with ZERO stderr, exit 0, `loaded_config_files: 0`. Since the no-config default is `danger-full-access` per #87, a commented-out `.claw.json` with `"defaultMode": "default"` silently UPGRADES permissions from intended `read-only` to `danger-full-access` — a security-critical semantic flip from the user's expressed intent to the polar opposite** — dogfooded 2026-04-18 on main HEAD `7859222` from `/tmp/cdVV`. Extends #86 (silent-drop) with the JSON5-partial-tolerance + alias-collapse angle.
+
+     **Concrete repro.**
+     ```
+     # Acceptance matrix on the same workspace, measuring loaded_config_files
+     # + resolved permission_mode:
+
+     # Accepted (loaded, permission = read-only):
+     $ cat > .claw.json << EOF
+     {
+       "permissions": {
+         "defaultMode": "default",
+       }
+     }
+     EOF
+     $ claw status --output-format json | jq '{loaded: .workspace.loaded_config_files, mode: .permission_mode}'
+     {"loaded": 1, "mode": "read-only"}
+     # Single trailing comma: OK.
+
+     # SILENTLY DROPPED (loaded=0, permission = danger-full-access — security flip):
+     $ cat > .claw.json << EOF
+     {
+       // legacy convention — should be OK
+       "permissions": {"defaultMode": "default"}
+     }
+     EOF
+     $ claw status --output-format json | jq '{loaded: .workspace.loaded_config_files, mode: .permission_mode}'
+     {"loaded": 0, "mode": "danger-full-access"}
+     # User intent: read-only. System: danger-full-access. ZERO warning.
+
+     $ claw status --output-format json 2>&1 >/dev/null
+     # stderr: empty
+
+     # Same for block comments, unquoted keys, BOM, single quotes:
+     $ printf '\xef\xbb\xbf{"permissions":{"defaultMode":"default"}}' > .claw.json
+     $ claw status --output-format json | jq '{loaded: .workspace.loaded_config_files, mode: .permission_mode}'
+     {"loaded": 0, "mode": "danger-full-access"}
+
+     $ cat > .claw.json << EOF
+     {
+       permissions: { defaultMode: "default" }
+     }
+     EOF
+     $ claw status --output-format json | jq '{loaded: .workspace.loaded_config_files, mode: .permission_mode}'
+     {"loaded": 0, "mode": "danger-full-access"}
+
+     # Matrix summary: 1 accepted, 7 silently dropped, zero stderr on any.
+     ```
+
+     **Trace path.**
+     - `rust/crates/runtime/src/config.rs:674-692` — `read_optional_json_object`:
+       ```rust
+       let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".claw.json");
+       // ...
+       let parsed = match JsonValue::parse(&contents) {
+           Ok(parsed) => parsed,
+           Err(_error) if is_legacy_config => return Ok(None),   // <-- silent drop
+           Err(error) => return Err(ConfigError::Parse(format!("{}: {error}", path.display()))),
+       };
+       ```
+       Parse failure on `.claw.json` specifically returns `Ok(None)` (legacy-compat swallow). #86 already covered this. **#120 extends** with the observation that the custom `JsonValue::parse` has a JSON5-partial acceptance profile — trailing comma tolerated, everything else rejected — and the silent-drop hides that inconsistency from the user.
+     - `rust/crates/runtime/src/json.rs` — `JsonValue::parse`. Custom parser. Accepts trailing comma at object/array end. Rejects comments (`//`, `/* */`), unquoted keys, single quotes, hex numbers, BOM, leading commas.
+     - `rust/crates/runtime/src/config.rs:856-858` — the permission-mode alias table:
+       ```rust
+       "default" | "plan" | "read-only" => Ok(ResolvedPermissionMode::ReadOnly),
+       "acceptEdits" | "auto" | "workspace-write" => Ok(ResolvedPermissionMode::WorkspaceWrite),
+       "dontAsk" | "danger-full-access" => Ok(ResolvedPermissionMode::DangerFullAccess),
+       ```
+       **Crucial semantic surprise**: `"default"` maps to `ReadOnly`. But the no-config default (per #87) maps to `DangerFullAccess`. "Default in the config file" and "no config at all" are **opposite** modes. A user who writes `"defaultMode": "default"` thinks they're asking for whatever the system default is; they're actually asking for the SAFEST mode. Meanwhile the actual system default on no-config-at-all is the DANGEROUS mode.
+     - #120's security amplification chain:
+       1. User writes `.claw.json` with a comment + `"defaultMode": "default"`. Intent: read-only.
+       2. `JsonValue::parse` rejects comments, returns parse error.
+       3. `read_optional_json_object` sees `is_legacy_config`, silently returns `Ok(None)`.
+       4. Config loader treats as "no config present."
+       5. `permission_mode` resolution falls back to the no-config default: `DangerFullAccess`.
+       6. User intent (read-only) → system behavior (danger-full-access). Inverted.
+
+     **Why this is specifically a clawability gap.**
+     1. *Silent security inversion.* The fail-mode isn't "fail closed" (default to strict) — it's "fail to the WORST possible mode." A user's attempt to EXPRESS an intent-to-be-safe silently produces the-opposite. A claw validating `claw status` for "permission_mode = read-only" sees `danger-full-access` and has no way to understand why.
+     2. *JSON5-partial acceptance creates a footgun.* If the parser rejected ALL JSON5 features, users would learn "strict JSON only" quickly. If it accepted ALL JSON5 features, users would have consistent behavior. Accepting ONLY trailing commas gives a false signal of JSON5 tolerance, inviting the lethal (comments/unquoted) misuse.
+     3. *Alias table collapse "default" → ReadOnly is counterintuitive.* Most users read `"defaultMode": "default"` as "whatever the default mode is." In claw-code it means specifically `ReadOnly`. The literal word "default" is overloaded.
+     4. *Joins truth-audit.* `loaded_config_files: 0` reports truthfully that 0 files loaded. But `permission_mode: danger-full-access` without any accompanying `config_parse_errors: [...]` fails to explain WHY. A claw sees "no config loaded, dangerous default" and has no signal that the user's `.claw.json` WAS present but silently dropped.
+     5. *Joins #86 (silent-drop) at a new angle.* #86 covers the general shape. #120 adds: the acceptance profile is inconsistent (accepts trailing comma, rejects comments) and the fallback is to `DangerFullAccess`, not to `ReadOnly`. These two facts compose into a security-critical user-intent inversion.
+     6. *Cross-cluster with #87 (no-config default = DangerFullAccess) and #115 (`claw init` generates `dontAsk` = DangerFullAccess)* — three axes converging on the same problem: **the system defaults are inverted from what the word "default" suggests**. Whether the user writes no config, runs init, or writes broken config, they end up at `DangerFullAccess`. That's only safe if the user explicitly opts OUT to `"defaultMode": "default"` / `ReadOnly` AND the config successfully parses.
+     7. *Claude Code migration parity double-break.* Claude Code's `.claude.json` is strict JSON. #116 showed claw-code rejects valid Claude Code keys with hard-fail. **#120 shows claw-code ALSO accepts non-JSON trailing commas that Claude Code would reject.** So claw-code is strict-where-Claude-was-lax AND lax-where-Claude-was-strict — maximum confusion for migrating users.
+
+     **Fix shape — reject JSON5 consistently OR accept JSON5 consistently; eliminate the silent-drop; clarify the alias table.**
+     1. *Decide the acceptance policy: strict JSON or explicit JSON5.* Rust ecosystem: `serde_json` is strict by default, `json5` crate supports JSON5. Pick one, document it, enforce it. If keeping the custom parser: remove trailing-comma acceptance OR add comment/unquoted/BOM/single-quote acceptance. Stop being partial. ~30 lines either direction.
+     2. *Replace the `is_legacy_config` silent-drop with warn-and-continue (already covered by #86 fix shape).* Apply #86's fix here too: any parse failure on `.claw.json` surfaces a structured warning. ~20 lines (overlaps with #86).
+     3. *Rename the `"default"` permission mode alias or eliminate it.* Options: (a) map `"default"` → `"ask"` (prompt for every destructive action, matching user expectation). (b) Rename `"default"` → `"read-only"` in docs and deprecate `"default"` as an alias. (c) Make `"default"` = the ACTUAL system default (currently `DangerFullAccess`), matching the meaning of the English word, and let users explicitly specify `"read-only"` if that's what they want. ~10 lines + documentation.
+     4. *Structure the `status` output to show config-drop state.* Add `config_parse_errors: [...]`, `discovered_files_count`, `loaded_files_count` all as top-level or under `workspace.config`. A claw can cross-check `discovered > loaded` to detect silent drops without parsing warnings from stderr. ~20 lines.
+     5. *Regression tests.*
+        - (a) `.claw.json` with comment → structured warning, `loaded_config_files: 0`, NOT `permission_mode: danger-full-access` unless config explicitly says so.
+        - (b) `.claw.json` with `"defaultMode": "default"` → `permission_mode: read-only` (existing behavior) OR `ask` (after rename).
+        - (c) No `.claw.json` + no env var → `permission_mode` resolves to a documented explicit default (safer than `danger-full-access`; or keep `danger-full-access` with loud doctor warning).
+        - (d) JSON5 acceptance matrix: pick a policy, test every case.
+
+     **Acceptance.** `claw status --output-format json` on a `.claw.json` with a parse error surfaces `config_parse_errors` in the structured output. Acceptance profile for `.claw.json` is consistent (strict JSON, OR explicit JSON5). The phrase "defaultMode: default" resolves to a mode that matches the English meaning of the word "default," not its most-aggressive alias. A user's attempt to express an intent-to-be-safe never produces a DangerFullAccess runtime without explicit stderr + JSON surface telling them so.
+
+     **Blocker.** Policy decisions (strict vs JSON5; alias table meanings; fallback mode when config drop happens) overlap with #86 + #87 + #115 + #116 decisions. Resolving all five together as a "permission-posture-plus-config-parsing audit" would be efficient.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdVV` on main HEAD `7859222` in response to Clawhip pinpoint nudge at `1494955670791913508`. Extends #86 (silent-drop) with novel JSON5-partial-acceptance angle + alias-collapse security inversion. Joins **Permission-audit / tool-allow-list** (#94, #97, #101, #106, #115) as 6th member — this is the CONFIG-PARSE anchor of the permission-posture problem, completing the matrix: #87 absence (no config), #101 env-var fail-OPEN, #115 init-generated dangerous default, **#120** config-drops-to-dangerous-default. Joins **Truth-audit / diagnostic-integrity** on the `loaded_config_files=0` + `permission_mode=danger-full-access` inconsistency. Joins **Reporting-surface / config-hygiene** (#90, #91, #92, #110, #115, #116) on the silent-drop-plus-no-stderr-plus-exit-0 axis. Joins **Claude Code migration parity** (#103, #109, #116, #117, #119) as 6th — claw-code is strict-where-Claude-was-lax (#116) AND lax-where-Claude-was-strict (#120). Natural bundle: **#86 + #120** — config-parse reliability pair: silent-drop general case (#86) + JSON5-partial-acceptance + alias-inversion security flip (#120). Also **permission-drift-at-every-boundary 4-way**: #87 + #101 + #115 + **#120** — absence + env-var + init-generated + config-drop. Complete coverage of how a workspace can end up at `DangerFullAccess`. Also **Jobdori+gaebal-gajae mega-bundle** ("security-critical permission drift audit"): #86 + #87 + #101 + #115 + #116 + **#120** (five-way sweep of every path to wrong permissions). Session tally: ROADMAP #120.
