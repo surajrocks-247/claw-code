@@ -2948,3 +2948,77 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. All additive. `HookProgressEvent` already exists in the runtime — this is pure plumbing and surfacing. Parallel to #102's MCP preflight fix — same pattern, different subsystem.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdBB` on main HEAD `a436f9e` in response to Clawhip pinpoint nudge at `1494834879127486544`. Joins **truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105) — `doctor: ok` is a lie when hooks are nonexistent or hostile. Joins **unplumbed-subsystem** (#78, #96, #100, #102, #103) — hook progress event model exists but JSON-invisible; `/hooks` is a declared-but-stubbed slash command. Joins **subsystem-doctor-coverage** (#100, #102, #103) as the fourth subsystem (git state / MCP / agents / **hooks**) that doctor fails to report on. Cross-cluster with **Permission-audit** (#94, #97, #101, #106) because hooks are effectively a permission mechanism that runs without audit. Compounds with #106 specifically: #106 says downstream layers can silently replace hook arrays; #107 says the resulting effective hook set is invisible; together they constitute a policy-erasure-plus-hide pair. Natural bundle: **#102 + #103 + #107** — subsystem-doctor-coverage 3-way (MCP + agents + hooks), closing the "subsystem silently opaque" class. Also **#106 + #107** — policy-erasure mechanism + policy-visibility gap = the complete hook-security story.
+
+108. **CLI subcommand typos fall through to the LLM prompt dispatch path and silently burn tokens — `claw doctorr`, `claw skilsl`, `claw statuss`, `claw deply` all resolve to `CliAction::Prompt { prompt: "doctorr", ... }` and attempt a live LLM turn. Slash commands have a "Did you mean /skill, /skills" suggestion system that works correctly; subcommands have the same infrastructure available but it is never applied. A claw or CI pipeline that typos a subcommand name gets no structural signal — just the prompt API error (usually "missing credentials" in local dev, or actual billed LLM output with provider keys configured)** — dogfooded 2026-04-18 on main HEAD `91c79ba` from `/tmp/cdCC`. Every unrecognized first-positional falls through the `_other => Ok(CliAction::Prompt { ... })` arm at `main.rs:707`, which is the documented shorthand-prompt mode — but with no levenshtein / prefix matching against the known subcommand set to offer a suggestion first. A claw running with `ANTHROPIC_API_KEY` set that runs `claw doctorr` actually sends the string "doctorr" to the configured LLM provider and pays for the tokens.
+
+     **Concrete repro.**
+     ```
+     $ cd /tmp/cdCC && git init -q .
+
+     # Correct subcommand — works
+     $ claw --output-format json doctor | jq '.kind'
+     "doctor"
+
+     # Typo subcommand — falls through to prompt dispatch
+     $ claw --output-format json doctorr 2>&1 | jq '.type'
+     "error"
+     $ claw --output-format json doctorr 2>&1 | jq '.error'
+     "missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY..."
+     # Error is FROM THE PROMPT CODE PATH, not a "did you mean doctor?" hint.
+
+     $ claw --output-format json skilsl 2>&1 | jq '.error'
+     "missing Anthropic credentials..."
+     # Would burn LLM tokens on "skilsl" if creds were set.
+
+     $ claw --output-format json statuss 2>&1 | jq '.error'
+     "missing Anthropic credentials..."
+     # Would burn LLM tokens on "statuss".
+
+     # Compare: slash command typo DOES get "Did you mean":
+     $ claw --resume s /skilsl
+     Unknown slash command: /skilsl
+       Did you mean     /skill, /skills
+       Help             /help lists available slash commands
+     # Infrastructure EXISTS. Just not applied to subcommand dispatch.
+
+     # Same contrast for an invalid flag — flag dispatch rejects loudly:
+     $ claw --output-format json --fake-flag 2>&1 | jq '.error'
+     "unknown option: --fake-flag\nRun `claw --help` for usage."
+     # Flags are rejected structurally. Subcommands are silently promptified.
+     ```
+
+     **Trace path.**
+     - `rust/crates/rusty-claude-cli/src/main.rs:696-718` — the end of `parse_args`'s subcommand match. After matching specific strings (`"help"`, `"version"`, `"status"`, `"sandbox"`, `"doctor"`, `"state"`, `"dump-manifests"`, `"bootstrap-plan"`, `"agents"`, `"mcp"`, `"skills"`, `"system-prompt"`, `"acp"`, `"login"`/`"logout"`, `"init"`, `"export"`, `"prompt"`), the final arm is:
+       ```rust
+       other if other.starts_with('/') => parse_direct_slash_cli_action(...),
+       _other => Ok(CliAction::Prompt {
+           prompt: rest.join(" "),
+           model, output_format, allowed_tools, permission_mode, compact,
+           base_commit, reasoning_effort, allow_broad_cwd,
+       }),
+       ```
+       `_other` covers "literally anything that wasn't a known subcommand or a slash command" — no levenshtein, no prefix match, no warning. It just assumes the operator meant to send a prompt.
+     - `rust/crates/rusty-claude-cli/src/main.rs` slash-command dispatch — contains a `bare_slash_command_guidance` / "did you mean" helper that accepts the unknown slash name and suggests close matches. The same function-shape (distance + prefix / substring match) is trivially reusable for subcommand names.
+     - `rust/crates/rusty-claude-cli/src/main.rs:755-765` — `parse_single_word_command_alias` is the place where a known-subcommand-alias list is matched for status/sandbox/doctor/state. This is the same point at which a "did you mean" suggestion could be hooked when the match fails.
+     - `grep 'did you mean\|Did you mean' rust/crates/rusty-claude-cli/src/main.rs | wc -l` — matches exist for slash commands and flags, not for subcommands.
+     - `rust/crates/rusty-claude-cli/src/main.rs:8307` — `--help` line: `claw [...] TEXT  Shorthand non-interactive prompt mode`. The shorthand mode is the *documented* behavior — so the typo-becomes-prompt path is technically-correct per the spec. The clawability gap is the missing safety net for known-subcommand typos.
+
+     **Why this is specifically a clawability gap.**
+     1. *Silent LLM spend on typos.* A claw or CI pipeline with `ANTHROPIC_API_KEY` set that typos `claw doctorr` sends "doctorr" to the LLM provider as a live prompt. The cost is not zero: a minimal turn costs 10s–100s of input tokens plus whatever the model responds with. Over a CI matrix of 100 lanes per day with a 1% typo rate, that's ~1 spurious API call per day per lane per typo class.
+     2. *Structural signal lost.* The returned error — "missing Anthropic credentials" or actual LLM output — is indistinguishable from a *real* prompt failure. A claw's error handler cannot tell "my subcommand was a typo" from "my prompt legitimately failed." Structured error signaling is a claw-code design principle (Product Principle "Events over scraped prose"); the subcommand typo surface violates it.
+     3. *Infrastructure already exists.* The slash-command dispatch already does levenshtein-style "Did you mean /skills" suggestions. Flag parsing already rejects unknown `--flags` with a structured error. Only the subcommand path has the silent-fallthrough behavior. The asymmetry is the gap, not a missing feature.
+     4. *Joins the "silent acceptance of malformed input" class.* #97 (empty `--allowedTools`), #98 (`--compact` ignored in 9 paths), #99 (unvalidated `--cwd`/`--date`), #101 (fail-open env-var), #104 (silent `.txt` suffix), **#108** (silent subcommand-to-prompt fallthrough). Six flavors of "operator typo silently produces unintended behavior."
+     5. *Cross-claw orchestration hazard.* A claw that dynamically constructs subcommand names from config or from another claw's output has a latent "subcommand name typo → live LLM call" vector. The fix (did-you-mean before Prompt fallthrough) is a one-function additional dispatcher that preserves the shorthand-prompt behavior for *actual* prose inputs while catching obvious subcommand typos.
+     6. *Bounded intent detection.* "Is this input a typo of a known subcommand?" is decidable with cheap heuristics: exact-prefix match of the known subcommand list (`dotr` → prefix of `doctor`), bounded-edit-distance (levenshtein ≤ 2), single-character-swap. Prose inputs rarely match any of these against the subcommand list; subcommand typos almost always do.
+
+     **Fix shape — insert a did-you-mean guard before the Prompt fallthrough.**
+     1. *Extract a `suggest_similar_subcommand(token) -> Option<Vec<String>>` helper.* Compute against the static list of known subcommands: `["help", "version", "status", "sandbox", "doctor", "state", "dump-manifests", "bootstrap-plan", "agents", "mcp", "skills", "system-prompt", "acp", "init", "export", "prompt"]`. Use levenshtein ≤ 2, or prefix/substring match length ≥ 4. ~40 lines.
+     2. *Gate the fallthrough on a shape heuristic.* Before `_other => CliAction::Prompt`, check: (a) single-token input (no spaces) that (b) matches a known-subcommand typo via the suggester. If both true, return `Err(format!("unknown subcommand: {token}. Did you mean: {suggestions}? Run `claw --help` for the full list. If you meant to send a prompt literally, wrap in quotes or prefix with `claw prompt`."))`. If either false, fall through to Prompt as today. ~20 lines.
+     3. *Preserve the shorthand-prompt mode for real prose.* Multi-word inputs (`claw explain this code`), quoted inputs (`claw "doctor"`), and inputs that don't match any known-subcommand typo continue through the existing fallthrough. The fix only catches the single-token near-match shape. ~0 extra lines — the guard is short-circuit.
+     4. *Regression tests.* One per typo shape (`doctorr`, `skilsl`, `statuss`, `deply`, `mcpp`, `sklils`). One for legitimate short prompt (`claw hello`) that should NOT trigger the guard. One for quoted workaround (`claw prompt "doctorr"`) that should dispatch to Prompt unchanged.
+
+     **Acceptance.** `claw doctorr` exits non-zero with structured JSON error `{"type":"error","error":"unknown subcommand: doctorr. Did you mean: doctor? ..."}`. `claw hello world this is a prompt` still dispatches to Prompt unchanged (multi-token, no near-match). `claw "doctorr"` (quoted single token) dispatches to Prompt unchanged, since operator explicitly opted into shorthand-prompt. Zero billed LLM calls from subcommand typos.
+
+     **Blocker.** None. ~60 lines of dispatcher logic + regression tests. The levenshtein helper is 20 lines of pure arithmetic. Shorthand-prompt mode preserved for all non-near-match inputs.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdCC` on main HEAD `91c79ba` in response to Clawhip pinpoint nudge at `1494849975530815590`. Joins **silent-flag / documented-but-unenforced** (#96–#101, #104) on the subcommand-dispatch axis — sixth instance of "malformed operator input silently produces unintended behavior." Joins **parallel-entry-point asymmetry** (#91, #101, #104, #105) as another pair-axis: slash commands vs subcommands disagree on typo handling. Sibling of **#96** on the `--help` / flag-validation hygiene axis: #96 is "help advertises commands that don't work," #108 is "help doesn't advertise that subcommand typos silently become LLM prompts." Natural bundle: **#96 + #98 + #108** — three `--help`-and-dispatch-surface hygiene fixes that together remove the operator footguns in the command-parsing pipeline (help leak + flag silent-drop + subcommand typo fallthrough). Also **#91 + #101 + #104 + #105 + #108** — the full 5-way parallel-entry-point asymmetry audit.
