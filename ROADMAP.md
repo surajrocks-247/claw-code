@@ -3094,3 +3094,87 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. All additive; no breaking changes. `ValidationResult` already carries the data — this is pure plumbing from validator → loader → config type → doctor/status surface. Parallel to #107's proposed plumbing for `HookProgressEvent`.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdDD` on main HEAD `21b2773` in response to Clawhip pinpoint nudge at `1494857528335532174`. Joins **truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107) — doctor says "ok" while the validator flagged deprecations. Joins **unplumbed-subsystem** (#78, #96, #100, #102, #103, #107) — structured validator output JSON-invisible. Joins **Claude Code migration parity** (#103) — legacy claude-code-style `permissionMode` at top level is deprecated but the migration path is stderr-only. Natural bundle: **#100 + #102 + #103 + #107 + #109** — five-way doctor-surface-coverage plus structured-warnings (becomes the "doctor stops lying" PR). Also **#107 + #109** — stderr-only-prose-warning sweep (hook progress events + config warnings), same plumbing pattern, paired tiny fix. Session tally: ROADMAP #109.
+
+110. **`ConfigLoader::discover` only looks at `$CWD/.claw.json`, `$CWD/.claw/settings.json`, and `$CWD/.claw/settings.local.json` — it does not walk up to `project_root` (the detected git root) to find config. A developer with `.claw.json` at the repo root who runs claw from a subdirectory gets ZERO config loaded. `doctor` reports `config: ok, no config files present; defaults are active`. `status.permission_mode` resolves to `danger-full-access` (the compile-time fallback) silently. Meanwhile CLAUDE.md / instruction files DO walk ancestors unbounded (per #85). Two adjacent discovery mechanisms, opposite strategies, no documentation, silently inconsistent behavior** — dogfooded 2026-04-18 on main HEAD `16244ce` from `/tmp/cdGG/nested/deep/dir`. The workspace-check correctly identifies `project_root: /tmp/cdGG` (via git-root walk), but config discovery never reaches that directory. A `.claw.json` at `/tmp/cdGG/.claw.json` (the project root) is INVISIBLE from any subdirectory below it. Under-discovery is the opposite failure mode from #85's over-discovery — same meta-issue: "ancestor walk policy is subsystem-by-subsystem ad-hoc, not principled."
+
+     **Concrete repro.**
+     ```
+     $ mkdir -p /tmp/cdGG/nested/deep/dir
+     $ cd /tmp/cdGG && git init -q .
+     $ echo '{"model":"haiku","permissions":{"defaultMode":"read-only"}}' > /tmp/cdGG/.claw.json
+
+     $ cd /tmp/cdGG/nested/deep/dir
+     $ claw --output-format json status | jq '{permission_mode, workspace: {cwd, project_root}}'
+     {
+       "permission_mode": "danger-full-access",
+       "workspace": {
+         "cwd": "/private/tmp/cdGG/nested/deep/dir",
+         "project_root": "/private/tmp/cdGG"
+       }
+     }
+     # project_root correctly walks UP to /tmp/cdGG. But permission_mode is danger-full-access
+     # (the compile-time fallback) instead of read-only (what .claw.json says).
+
+     $ claw --output-format json doctor 2>/dev/null | jq '.checks[] | select(.name=="config") | {status, summary, details}'
+     {
+       "status": "ok",
+       "summary": "no config files present; defaults are active",
+       "details": [
+         "Config files      loaded 0/0",
+         "MCP servers       0",
+         "Discovered files  <none> (defaults active)"
+       ]
+     }
+     # Zero files discovered. .claw.json at /tmp/cdGG/.claw.json is invisible.
+     # "defaults are active" — but the operator's intent was read-only.
+
+     # Compare: CLAUDE.md discovery DOES walk ancestors (per #85)
+     $ echo '# Instructions' > /tmp/cdGG/CLAUDE.md
+     $ claw --output-format json status | jq '.workspace.memory_file_count'
+     1
+     # CLAUDE.md found via ancestor walk. .claw.json wasn't.
+
+     # Also compare: running from the repo root works as expected
+     $ cd /tmp/cdGG && claw --output-format json status | jq '.permission_mode'
+     "read-only"
+     # From cwd=repo-root, .claw.json at cwd IS discovered. Config works.
+     # Same operator, same workspace, different cwd → different config loaded.
+     ```
+
+     **Trace path.**
+     - `rust/crates/runtime/src/config.rs:242-270` — `ConfigLoader::discover`:
+       ```rust
+       vec![
+           ConfigEntry { source: User,   path: user_legacy_path },
+           ConfigEntry { source: User,   path: self.config_home.join("settings.json") },
+           ConfigEntry { source: Project, path: self.cwd.join(".claw.json") },
+           ConfigEntry { source: Project, path: self.cwd.join(".claw").join("settings.json") },
+           ConfigEntry { source: Local,  path: self.cwd.join(".claw").join("settings.local.json") },
+       ]
+       ```
+       Every project+local entry uses `self.cwd.join(...)`. No ancestor walk. No consultation of `project_root` / git-root. If cwd ≠ project_root, config is lost.
+     - `rust/crates/runtime/src/config.rs:292` — `for entry in self.discover()` — iterates the fixed list and attempts to read each. A nonexistent file at cwd is simply treated as absent; the "project" config that actually exists at the git root is never even considered.
+     - `rust/crates/runtime/src/prompt.rs:203-224` — `discover_instruction_files` (for CLAUDE.md) does walk ancestors up to filesystem root (#85's over-discovery gap). Same concept, opposite strategy, different subsystem. The two ancestor-discovery policies disagree for no documented reason.
+     - `rust/crates/rusty-claude-cli/src/main.rs:1485` — `render_doctor_report` reports `workspace.project_root` correctly via a git-root walk. The same walk is NOT consulted by `ConfigLoader`. Project-root detection and config-discovery are independent code paths with incompatible anchoring.
+
+     **Why this is specifically a clawability gap.**
+     1. *Silent config loss in the common-case layout.* The standard project layout is: `.claw.json` at the git root, multiple subdirectories for code/tests/docs. Developers routinely `cd` into subdirectories to run builds or tests. Claws running inside a worktree subdirectory (e.g., a test runner's cwd at `$REPO/tests`) get `defaults are active` — not the operator's intended config.
+     2. *Asymmetry with CLAUDE.md / instruction files.* `#85` flags that instruction-file discovery walks ancestors unbounded (a different problem — over-discovery). Here: config-file discovery does not walk ancestors at all (under-discovery). Same subsystem category (workspace-scoped discovery), opposite behavior. No documentation explains why.
+     3. *Asymmetry with project_root detection.* The same `render_doctor_report` / `status` output correctly reports `project_root: /tmp/cdGG` — it knows how to walk up. `ConfigLoader` has access to the same cwd and could call the same helper, but it doesn't. Two adjacent pieces of workspace logic disagree.
+     4. *Doctor lies by omission.* `config: ok, no config files present; defaults are active` implies the operator hasn't configured anything. But the operator HAS configured — claw just doesn't see it. "0/0 files present" is misleading when a file DOES exist at the project root.
+     5. *Permission-mode fallback silently applies.* Per #87, the compile-time fallback is `danger-full-access`. Combined with this finding: cd'ing to a subdirectory silently upgrades permissions from read-only (configured) to danger-full-access (fallback). Security-adjacent: workspace-location-dependent permission drift.
+     6. *Roadmap Product Principle #4 ("Branch freshness before blame")* assumes per-workspace config exists and is honored. Per-workspace config is unreliable when any subdirectory invocation loses it.
+
+     **Fix shape — anchor config discovery at `project_root` with cwd overlay.**
+     1. *Walk ancestors to find the outermost `project_root` marker (git root or `.claw` dir), then discover config from that anchor.* Add a `project_root_for(&cwd)` helper (reuse the existing git-root walker from `render_doctor_report`). Config search order becomes: user → project_root/.claw.json → project_root/.claw/settings.json → cwd/.claw.json (overlay) → cwd/.claw/settings.json (overlay) → cwd/.claw/settings.local.json. ~40 lines.
+     2. *Optionally, also walk intermediate ancestors between cwd and project_root.* A `.claw.json` at `/tmp/cdGG/nested/.claw.json` (intermediate) should be discoverable from `/tmp/cdGG/nested/deep/dir`. Symmetric with how git sub-project conventions work and with `.gitignore` precedence. ~15 lines.
+     3. *Surface "where did my config come from" in doctor.* Add per-discovered-file source-path + source-directory to the doctor JSON. Operators can see exactly which file contributed each key (pairs with #106's proposed provenance and #109's warnings surface). ~20 lines.
+     4. *Detect and warn on ambiguous cwd ≠ project_root cases.* When cwd has no config but project_root does, emit a structured warning `config_scope_mismatch: {cwd, project_root, project_root_config_path}`. ~10 lines. Same plumbing as #109's proposed warnings surface.
+     5. *Documentation parity.* Document the ancestor-walk policy for both CLAUDE.md and config files. Ideally, unify them under a single policy (walk to project_root, overlay cwd files). ~5 lines of doc.
+     6. *Regression tests.* Per cwd-relative-to-project-root position (at root, 1 level deep, 3 levels deep, outside repo). Overlay precedence test. Config-scope-mismatch warning test.
+
+     **Acceptance.** `cd /tmp/cdGG/nested/deep/dir && claw --output-format json status` with `.claw.json` at `/tmp/cdGG/.claw.json` exposes `permission_mode: "read-only"` (config honored from project root), not `danger-full-access` (fallback). `doctor` reports `Config files loaded 1/N` with the project-root config file discovered. `cd /tmp/cdGG/nested && echo '{"model":"opus"}' > .claw.json` produces a discoverable overlay. Running from any subdirectory yields deterministic per-workspace config resolution. Documentation explains the policy.
+
+     **Blocker.** None. `project_root_for` helper trivially reusable from the git-root walker. Discovery list is additive — adding ancestor entries doesn't break existing cwd-anchored configs. Most invasive piece is the architectural decision: walk-to-project-root + cwd-overlay (this proposal), or walk-every-ancestor-like-CLAUDE.md (#85's current over-broad policy), or unify both under a single policy.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdGG/nested/deep/dir` on main HEAD `16244ce` in response to Clawhip pinpoint nudge at `1494865079567519834`. Joins **truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107, #109) — doctor reports "ok, defaults active" when the operator actually has a config. Joins **discovery-overreach / security-shape** (#85, #88) as the opposite-direction sibling: #85 over-discovers instruction files; #110 under-discovers config files. Cross-cluster with **Reporting-surface / config-hygiene** (#90, #91, #92) — this is the canonical config-discovery policy bug. Natural bundle: **#85 + #110** — unify ancestor-discovery policy across CLAUDE.md + config. Also **#85 + #88 + #110** as the three-way "ancestor-walk policy audit" covering skills over-discovery, CLAUDE.md prompt injection via ancestors, and config under-discovery from subdirectories. Session tally: ROADMAP #110.
