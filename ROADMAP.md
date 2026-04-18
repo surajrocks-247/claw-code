@@ -3609,3 +3609,98 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** Product decision: is `init`-default `danger-full-access` intentional (for low-friction onboarding) or accidental? If intentional, the fix is warning-only. If accidental, the fix is a safer default.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdPP` on main HEAD `ca09b6b` in response to Clawhip pinpoint nudge at `1494917922076889139`. Joins **Permission-audit / tool-allow-list** (#94, #97, #101, #106) as 5th member — this is the init-time ANCHOR of the permission-posture problem: #87 is absence-of-config, #101 is fail-OPEN on bad env var, **#115** is the init-generated dangerous default. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111) on the third axis: not a silent flag, but a silent setting (the generated config's security implications are silent in the init output). Cross-cluster with **Reporting-surface / config-hygiene** (#90, #91, #92, #110) on the structured-data-vs-prose axis: `claw init --output-format json` wraps all structure inside `message`. Cross-cluster with **Truth-audit** on "Next step: Review and tailor the generated guidance" phrasing — misleads by omission. Natural bundle: **#87 + #101 + #115** — "permission drift at every boundary": absence default + env-var bypass + init-generated default. Also: **#50 + #87 + #91 + #94 + #97 + #101 + #115** — flagship permission-audit sweep now 7-way. Session tally: ROADMAP #115.
+
+116. **Unknown keys in `.claw.json` are strict ERRORS, not warnings — `claw` hard-fails at startup with exit 1 if any field is unrecognized. Only the FIRST error is reported; all subsequent validation messages are lost. Valid Claude Code config fields (`apiKeyHelper`, `env`, and other Claude-Code-native keys) trigger the same hard-fail, so a user renaming `.claude.json → .claw.json` for migration gets `"unknown key \"apiKeyHelper\"" ... exit 1` with zero guidance on what to delete. The error goes to stderr as structured JSON (`{"type":"error","error":"..."}`) but a `--output-format json` consumer has to read BOTH stdout AND stderr to capture success-or-error — the stdout side is empty on error. There is no `--ignore-unknown-config` flag, no `strict` vs `warn` mode toggle, no forward-compat path — a claw's future-self putting a single new field in the config kills every older claw binary** — dogfooded 2026-04-18 on main HEAD `ad02761` from `/tmp/cdRR`.
+
+     **Concrete repro.**
+     ```
+     # Forward-compat scenario — config has a "future" field:
+     $ cd /tmp/cdRR && git init -q .
+     $ cat > .claw.json << 'EOF'
+     {
+       "permissions": {"defaultMode": "default"},
+       "futureField": "some-feature"
+     }
+     EOF
+     $ claw --output-format json status
+     # stdout: (empty)
+     # stderr: {"type":"error","error":"/private/tmp/cdRR/.claw.json: unknown key \"futureField\" (line 3)"}
+     # exit: 1
+
+     # Claude Code migration scenario — rename .claude.json to .claw.json:
+     $ cat > .claw.json << 'EOF'
+     {
+       "permissions": {"defaultMode": "default"},
+       "apiKeyHelper": "/usr/local/bin/key-helper",
+       "env": {"FOO": "bar"}
+     }
+     EOF
+     $ claw --output-format json status
+     # stderr: {"type":"error","error":"/private/tmp/cdRR/.claw.json: unknown key \"apiKeyHelper\""}
+     # apiKeyHelper is a real Claude Code config field. claw-code refuses it.
+
+     # Multiple unknowns — only the first is reported:
+     $ cat > .claw.json << 'EOF'
+     {
+       "a_bad": 1,
+       "b_bad": 2,
+       "c_bad": 3
+     }
+     EOF
+     $ claw --output-format json status
+     # stderr: unknown key "a_bad" (line 2)
+     # User fixes a_bad, re-runs, gets b_bad error. Iterative discovery.
+
+     # No escape hatch:
+     $ claw --ignore-unknown-config --output-format json status
+     # stderr: unknown option: --ignore-unknown-config
+     ```
+
+     **Trace path.**
+     - `rust/crates/runtime/src/config.rs:282-291` — `ConfigLoader` validation gate:
+       ```rust
+       let validation = crate::config_validate::validate_config_file(
+           &parsed.object,
+           &parsed.source,
+           &entry.path,
+       );
+       if !validation.is_ok() {
+           let first_error = &validation.errors[0];
+           return Err(ConfigError::Parse(first_error.to_string()));
+       }
+       all_warnings.extend(validation.warnings);
+       ```
+       `validation.is_ok()` means `errors.is_empty()`. Any error in the vec halts loading. Only `errors[0]` is surfaced. `validation.warnings` is accumulated and later `eprintln!`d as prose (already covered in #109).
+     - `rust/crates/runtime/src/config_validate.rs:19-47` — `DiagnosticKind::UnknownKey`:
+       ```rust
+       UnknownKey { suggestion: Option<String> }
+       ```
+       Unknown keys produce a `ConfigDiagnostic` with `level: DiagnosticLevel::Error`. They're classified as errors, not warnings.
+     - `rust/crates/runtime/src/config_validate.rs:380-395` — unknown-key detection walks the parsed object, compares keys against a hard-coded known list, emits `Error`-level diagnostics for any mismatch.
+     - `rust/crates/runtime/src/config_validate.rs` — `SCHEMA_FIELDS` or equivalent allow-list is a fixed set. There is no forward-compat extension mechanism (no `extensions` / `x-*` prefix convention, no reserved namespace, no `additionalProperties` toggle).
+     - `grep -rn "apiKeyHelper" rust/crates/runtime/` → zero matches. Claude-Code-native fields are not recognized even as no-ops; they are outright rejected.
+     - `grep -rn "ignore.*unknown\|--no-validate\|strict.*validation" rust/crates/` → zero matches. No escape hatch.
+
+     **Why this is specifically a clawability gap.**
+     1. *Forward-compat is impossible.* If a claw upgrade adds a new config field, any older binary (CI cache, legacy nodes, stuck deployments) hard-fails on the new field. This is the opposite of how tools like `cargo`, `jq`, most JSON APIs, and every serde-derived Rust config loader handle unknowns (warn or silently accept by default).
+     2. *Only `errors[0]` is reported per run.* Fixing N unknown fields requires N edit-run-fix cycles. A claw running `claw status` inside a validation loop has to re-invoke for every unknown. This joins #109 where only the first error surfaces structurally; the rest are discarded.
+     3. *Claude Code migration parity is broken.* The README and user docs for claw-code position it as Claude-Code-compatible. Users who literally `cp .claude.json .claw.json` get immediate hard-fail on `apiKeyHelper`, `env`, and other legitimate Claude Code fields. No graceful "this is a Claude Code field we don't support, ignored" message.
+     4. *Error-routing split.* With `--output-format json`, success goes to stdout, errors go to stderr. Claws orchestrating claw must capture both streams and correlate. A claw that `claw status | jq .permission_mode` silently gets empty output when config is broken — the error is invisible to the pipe consumer.
+     5. *Joins #109 (validation warnings stderr-only).* #109 said warnings are prose-on-stderr and the structured form is discarded. #116 adds: errors also go to stderr (structured as JSON this time, good), but in a hard-fail way that prevents the stdout channel from emitting ANYTHING. A claw gets either pure-JSON success or empty-stdout + JSON-error-stderr; it must always read both.
+     6. *No strict-vs-lax mode.* Tools that support forward-compat typically have two modes: strict (reject unknown) for production, lax (warn on unknown) for developer workflows. claw-code has neither toggle; it's strict always.
+     7. *Joins Claude Code migration parity cluster* (#103, #109). #103 was `claw agents` dropping non-`.toml` files. #109 was stderr-only prose warnings. **#116** is the outright rejection of Claude-Code-native config fields at load time.
+
+     **Fix shape — make unknown keys warnings by default, add explicit strict mode, collect all errors per run.**
+     1. *Downgrade `DiagnosticKind::UnknownKey` from Error to Warning by default.* The parser still surfaces the diagnostic; the CLI just doesn't halt on it. ~5 lines.
+     2. *Add `strict` mode flag.* `.claw.json` top-level `{"strictValidation": true}` OR `--strict-config` CLI flag. When set, unknown keys become errors as today. Default: off. ~15 lines.
+     3. *Collect all diagnostics, don't halt on first.* Replace `errors[0]` return with full `errors: [...]` collection, then decide fatal-or-not based on severity + strict-mode flag. ~20 lines.
+     4. *Recognize Claude-Code-native fields as explicit no-ops.* Add `apiKeyHelper`, `env`, and other known Claude Code fields to a `TOLERATED_CLAUDE_CODE_FIELDS` allow-list that emits a migration-hint warning: `"apiKeyHelper" is a Claude Code field not yet supported by claw-code; ignored.` ~30 lines.
+     5. *Include structured errors in the `--output-format json` stdout payload on hard fail.* Currently `{"type":"error","error":"..."}` goes to stderr and stdout is empty. Emit a machine-readable error envelope on stdout as well (or exclusively), with `config_diagnostics: [{level, field, location, message}]`. Keep stderr human-readable. ~15 lines.
+     6. *Add suggestion-by-default for UnknownKey.* The parser already supports `suggestion: Option<String>` in the DiagnosticKind — wire it to a fuzzy-match across the schema. `"permisions"` → `"permissions"` suggestion. ~15 lines.
+     7. *Regression tests.* (a) Forward-compat config with novel field loads without error. (b) Strict mode opt-in rejects unknown. (c) All diagnostics reported, not just first. (d) apiKeyHelper + env + other Claude Code fields produce migration-hint warning, not hard-fail. (e) `--output-format json` stdout contains error envelope on validation failure.
+
+     **Acceptance.** `cp .claude.json .claw.json && claw status` loads without hard-fail and emits a migration-hint warning for each Claude-Code-native field. `echo '{"newFutureField": 1}' > .claw.json && claw status` loads with a single warning, not a fatal error. `claw --strict-config status` retains today's strict behavior. All diagnostics are reported, not just `errors[0]`. `--output-format json` emits errors on stdout in addition to stderr.
+
+     **Blocker.** Policy decision: does the project want strict-by-default (current) or lax-by-default? The fix shape assumes lax-by-default with strict opt-in, matching industry-standard forward-compat conventions and easing Claude Code migration.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdRR` on main HEAD `ad02761` in response to Clawhip pinpoint nudge at `1494925472239321160`. Joins **Claude Code migration parity** (#103, #109) as 3rd member — this is the most severe migration-parity break, since it's a HARD FAIL at startup rather than a silent drop (#103) or a stderr-prose warning (#109). Joins **Reporting-surface / config-hygiene** (#90, #91, #92, #110, #115) on the error-routing-vs-stdout axis: `--output-format json` consumers get empty stdout on config errors. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115) because only the first error is reported and all subsequent errors are silent. Cross-cluster with **Truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107, #109, #110, #112, #114, #115) because `validation.is_ok()` hides all-but-the-first structured problem. Natural bundle: **#103 + #109 + #116** — Claude Code migration parity triangle: `claw agents` drops `.md` (loss of compatibility) + config warnings stderr-prose (loss of structure) + config unknowns hard-fail (loss of forward-compat). Also **#109 + #116** — config validation reporting surface: only first warning surfaces structurally (#109) + only first error surfaces structurally and halts loading (#116). Session tally: ROADMAP #116.
