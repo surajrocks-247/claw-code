@@ -4482,3 +4482,71 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. Localized across parse + status JSON + doctor check.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdAA2` on main HEAD `bb76ec9` in response to Clawhip pinpoint nudge at `1495000973914144819`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118, #119, #121, #122, #123) as 17th — `--model` silently accepts garbage with no validation. Joins **Truth-audit / diagnostic-integrity** — status JSON model field has no provenance. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117, #122, #123) as 10th — `--model` flag, `.claw.json model`, and the default model are three sources that disagree (#105 adjacent). Natural bundle: **#105 + #124** — model-resolution pair: 4-surface disagreement (#105) + no validation + no provenance (#124). Also **#122 + #124** — unvalidated-flag pair: `--base-commit` accepts anything (#122) + `--model` accepts anything (#124). Same parser pattern. Session tally: ROADMAP #124.
+
+125. **`git_state: "clean"` is emitted by both `status` and `doctor` JSON even when `in_git_repo: false` — a non-git directory reports the same sentinel as a git repo with no changes. `GitWorkspaceSummary::default()` returns all-zero fields; `is_clean()` checks `changed_files == 0` → true → `headline() = "clean"`. A claw checking `if git_state == "clean" then proceed` would proceed even in a non-git directory. Doctor correctly surfaces `in_git_repo: false` and `summary: "current directory is not inside a git project"`, but the `git_state` field contradicts this by claiming "clean." Separately, `claw init` creates a `.gitignore` file even in non-git directories — not harmful (ready for future `git init`) but misleading** — dogfooded 2026-04-18 on main HEAD `debbcbe` from `/tmp/cdBB2`.
+
+     **Concrete repro.**
+     ```
+     $ mkdir /tmp/cdBB2 && cd /tmp/cdBB2
+     # NO git init — bare directory
+
+     $ claw init
+     Init
+       Project          /private/tmp/cdBB2
+       .claw/           created
+       .claw.json       created
+       .gitignore       created        # created in non-git dir
+       CLAUDE.md        created
+
+     $ claw --output-format json status | jq '{git_branch: .workspace.git_branch, git_state: .workspace.git_state, project_root: .workspace.project_root}'
+     {"git_branch": null, "git_state": "clean", "project_root": null}
+     # git_state: "clean" despite NO GIT REPO.
+
+     $ claw --output-format json doctor | jq '.checks[] | select(.name=="workspace") | {in_git_repo, git_state, status, summary}'
+     {"in_git_repo": false, "git_state": "clean", "status": "warn", "summary": "current directory is not inside a git project"}
+     # in_git_repo: false BUT git_state: "clean"
+     # status: "warn" + summary: "not inside a git project" — CONTRADICTS git_state "clean"
+     ```
+
+     **Trace path.**
+     - `rust/crates/rusty-claude-cli/src/main.rs:2550-2554` — `parse_git_workspace_summary`:
+       ```rust
+       fn parse_git_workspace_summary(status: Option<&str>) -> GitWorkspaceSummary {
+           let mut summary = GitWorkspaceSummary::default();
+           let Some(status) = status else {
+               return summary;  // returns all-zero default when no git
+           };
+       ```
+       When `project_context.git_status` is `None` (non-git), returns `GitWorkspaceSummary { changed_files: 0, staged_files: 0, unstaged_files: 0, ... }`.
+     - `rust/crates/rusty-claude-cli/src/main.rs:2348-2355` — `GitWorkspaceSummary::headline`:
+       ```rust
+       fn headline(self) -> String {
+           if self.is_clean() {
+               "clean".to_string()
+           } else { ... }
+       }
+       ```
+       `is_clean()` = `changed_files == 0` → true for all-zero default → returns "clean" even when there's no git.
+     - `rust/crates/rusty-claude-cli/src/main.rs:4950` — status JSON builder uses `context.git_summary.headline()` for the `git_state` field.
+     - `rust/crates/rusty-claude-cli/src/main.rs:1856` — doctor workspace check uses the same `headline()` for the `git_state` field, alongside the separate `in_git_repo: false` field.
+
+     **Why this is specifically a clawability gap.**
+     1. *False positive "clean" on non-git directories.* A claw preflighting with `git_state == "clean" && project_root != null` would work. But a claw checking ONLY `git_state == "clean"` (the simpler, more obvious check) would proceed in non-git directories. The `null` project_root is the real guard, but git_state misleads.
+     2. *Contradictory fields in doctor.* `in_git_repo: false` + `git_state: "clean"` in the same check. A claw reading one field gets "not in git"; reading the other gets "git is clean." The two fields should be consistent or `git_state` should be `null`/absent when `in_git_repo` is false.
+     3. *Joins truth-audit.* The "clean" sentinel is a truth claim about git state. When there's no git, the claim is vacuously true at best, actively misleading at worst.
+     4. *Adjacent to #89 (claw blind to mid-rebase/merge).* #89 said git_state doesn't capture rebase/merge/cherry-pick. **#125** says git_state also doesn't capture "not in git" — another missing state.
+     5. *Minor: `claw init` creates `.gitignore` without git.* Not harmful but joins the pattern of init producing artifacts for absent subsystems (`.gitignore` without git, `.claw.json` with `dontAsk` per #115).
+
+     **Fix shape — null `git_state` when not in git repo.**
+     1. *Return `None` from `parse_git_workspace_summary` when status is `None`.* Change return type to `Option<GitWorkspaceSummary>`. ~10 lines.
+     2. *`headline()` returns `Option<String>`.* `None` when no git, `Some("clean")` / `Some("dirty · ...")` when in git. ~5 lines.
+     3. *Status JSON: `git_state: null` when not in git.* Currently always a string. ~3 lines.
+     4. *Doctor check: omit `git_state` field entirely when `in_git_repo: false`.* Or set to `null` / `"no-git"`. ~3 lines.
+     5. *Optional: `claw init` warns when creating `.gitignore` in non-git directory.* Or: skip `.gitignore` creation when not in git. ~5 lines.
+     6. *Regression tests.* (a) Non-git directory → `git_state: null` (not "clean"). (b) Git repo with clean state → `git_state: "clean"`. (c) Detached HEAD → `git_state: "clean"` + `git_branch: "detached HEAD"` (current behavior, already correct).
+
+     **Acceptance.** `claw --output-format json status` in a non-git directory shows `git_state: null` (not "clean"). Doctor workspace check with `in_git_repo: false` has `git_state: null` (or absent). A claw checking `git_state == "clean"` correctly rejects non-git directories.
+
+     **Blocker.** None. ~25 lines across two files.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdBB2` on main HEAD `debbcbe` in response to Clawhip pinpoint nudge at `1495016073085583442`. Joins **Truth-audit / diagnostic-integrity** — `git_state: "clean"` is a lie for non-git directories. Adjacent to **#89** (claw blind to mid-rebase) — same field, different missing state. Joins **#100** (status/doctor JSON gaps) — another field whose value doesn't reflect reality. Natural bundle: **#89 + #100 + #125** — git-state-completeness triple: rebase/merge invisible (#89) + stale-base unplumbed (#100) + non-git "clean" lie (#125). Complete coverage of git_state field failures. Session tally: ROADMAP #125.
