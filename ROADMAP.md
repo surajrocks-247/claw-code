@@ -3335,3 +3335,75 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. Advisory locking is a well-worn pattern; `fs2` crate is already in the Rust ecosystem. Domain error mapping is additive. The architectural decision is whether to serialize at the save boundary (simpler, some perf cost) or implement a full MVCC-style session store (far more work, out of scope).
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdII` on main HEAD `a049bd2` in response to Clawhip pinpoint nudge at `1494880177099116586`. Joins **truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107, #109, #110) — the error message lies about what actually happened (file vanished via concurrent rename, not intrinsic absence). Joins **Session handling** as a new micro-cluster (only existing member was #93 — reference-resolution semantics). Natural bundle: **#93 + #112** — session semantic correctness (reference resolution + concurrent-modification error clarity). Adjacent to **#104** (two-paths-diverge export) on the session-file-handling axis: #104 says the two export paths disagree on filename; #112 says concurrent session-file writers race with no advisory lock. Together session-handling has filename-semantic + concurrency gaps that the test suite should cover. Session tally: ROADMAP #112.
+
+113. **`/session switch`, `/session fork`, and `/session delete` are registered by the parser (produce `SlashCommand::Session { action, target }`), documented in `--help` as first-class session-management verbs, but dispatch in `run_resume_command` implements ONLY `/session list` with a dedicated handler at `main.rs:2908` — every other `Session { .. }` variant falls through to the "unsupported resumed slash command" bucket at `main.rs:2936`. There is also no `claw session <verb>` CLI subcommand: `claw session delete s` falls through to Prompt dispatch per #108. Net effect: claws can enumerate sessions via `/session list`, but CANNOT programmatically switch, fork, or delete — those are REPL-interactive only, with no `--output-format json`-compatible alternative and no `claw session ...` CLI equivalent. Help advertises the capability universally; implementation surfaces it only in the REPL** — dogfooded 2026-04-18 on main HEAD `8b25daf` from `/tmp/cdJJ`. Full test matrix: `/session list` works from `--resume` (returns structured JSON), `/session switch s` / `/session fork foo` / `/session delete s` / `/session delete s --force` all return `{"type":"error","error":"unsupported resumed slash command"}`.
+
+     **Concrete repro.**
+     ```
+     $ cd /tmp/cdJJ && git init -q .
+     $ # ... set up session at .claw/sessions/<bucket>/s.jsonl ...
+
+     $ for cmd in "list" "switch s" "fork foo" "delete s" "delete s --force"; do
+     >   result=$(claw --resume s --output-format json /session $cmd 2>&1 | head -c 100)
+     >   echo "/session $cmd → $result"
+     > done
+     /session list              → {"kind":"session_list","sessions":["s"],"active":"s"}
+     /session switch s          → {"type":"error","error":"unsupported resumed slash command",...}
+     /session fork foo          → {"type":"error","error":"unsupported resumed slash command",...}
+     /session delete s          → {"type":"error","error":"unsupported resumed slash command",...}
+     /session delete s --force  → {"type":"error","error":"unsupported resumed slash command",...}
+
+     # No CLI subcommand either — falls through per #108:
+     $ claw session delete s
+     error: missing Anthropic credentials ...   # Prompt-fallthrough, not session handler
+
+     # Help documents all session verbs as if they are universally available:
+     $ claw --help | grep /session
+       /session [list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]
+         List, switch, fork, or delete managed local sessions
+     # "List, switch, fork, or delete" — three of four are REPL-only.
+     ```
+
+     **Trace path.**
+     - `rust/crates/rusty-claude-cli/src/main.rs:10618` — parser builds `SlashCommand::Session { action, target }` for every subverb. All variants parse successfully.
+     - `rust/crates/rusty-claude-cli/src/main.rs:2908-2925` — dedicated `/session list` handler:
+       ```rust
+       SlashCommand::Session { action: Some(ref act), .. } if act == "list" => {
+           let sessions = list_managed_sessions().unwrap_or_default();
+           // ... returns structured JSON with sessions[] and active ...
+       }
+       ```
+       Only `list` is implemented.
+     - `rust/crates/rusty-claude-cli/src/main.rs:2936-2940+` — catch-all:
+       ```rust
+       SlashCommand::Session { .. }
+       | SlashCommand::Plugins { .. }
+       // ... many other variants ...
+       => Err(format_unsupported_resumed_slash_command(...)),
+       ```
+       `switch` / `fork` / `delete` (and their arguments) are all lumped into this bucket.
+     - `rust/crates/rusty-claude-cli/src/main.rs:3963` — `SlashCommand::Session { action, target }` is HANDLED in the `LiveCli::handle_repl_command` path (REPL mode). Interactive-only implementations exist for `switch` / `fork` / `delete` — they just never made it into the `--resume` dispatch.
+     - `rust/crates/runtime/src/session_control.rs:131+` — `SessionStore::resolve_reference`, `delete_managed_session`, `fork_managed_session` are all implemented at the runtime level. The backing code exists. The `--resume` flow simply does not call it for anything except `list`.
+     - `grep -rn "claw session\b" rust/crates/rusty-claude-cli/src/main.rs` — zero matches. There is no top-level `claw session` subcommand. `claw session <verb>` falls through to the Prompt dispatch arm (#108).
+
+     **Why this is specifically a clawability gap.**
+     1. *Declared universally, delivered partially.* `--help` shows all four verbs as one unified capability. Help is the only place a claw discovers what's possible. The help line is technically true for the REPL but misleading for automated / `--output-format json` consumers.
+     2. *No programmatic alternative.* There is no `claw session switch s` / `claw session fork foo` / `claw session delete s` CLI subcommand. A claw orchestrating session lifecycle at scale has three options: (a) start an interactive REPL (impossible without a TTY), (b) manually touch `.claw/sessions/` with `rm` / `cp` (bypasses claw's internal bookkeeping), (c) stick to `/session list` + `/clear` and accept the missing verbs.
+     3. *Runtime implementation is already there.* `SessionStore::delete_managed_session`, `SessionStore::fork_managed_session`, `SessionStore::resolve_reference` all exist in `session_control.rs`. The CLI just doesn't call them from the `--resume` dispatch path. Pure plumbing gap — parallel to #78 (plugins CLI route never wired) and #111 (providers slash dispatches to wrong handler).
+     4. *Joins the declared-but-not-as-declared cluster* (#78, #96, #111) — session verbs are registered and parsed but three of four are un-dispatchable from machine-readable surfaces. Different flavor than #78 (wrong fallthrough) or #111 (wrong handler); this is "no handler registered at all for the resume dispatch path."
+     5. *REPL is not accessible to claws.* A claw running `claw` without a TTY (CI, background task, another claw's subprocess) gets the REPL startup banner and immediately exits (or hangs on stdin). There is no automated way to invoke the REPL-only verbs.
+     6. *Manual filesystem fallback breaks session bookkeeping.* A claw that `rm`s a `.jsonl` file directly bypasses any hypothetical future cleanup-of-rotated-logs, bucket-lock release (per #112's proposed locking), or managed-session index updates. The forward-looking fix for #112 (advisory locks) would make manual `rm` even more fragile.
+
+     **Fix shape — implement the missing verbs in `run_resume_command` + add a `claw session <verb>` CLI subcommand.**
+     1. *Implement `/session switch <id>` in `run_resume_command`.* Call `SessionStore::resolve_reference(id)` + load + validate workspace + return new `ResumeCommandOutcome` with `{kind: "session_switched", from: ..., to: ...}`. ~25 lines.
+     2. *Implement `/session fork [branch-name]`.* Call `SessionStore::fork_managed_session` + return `{kind: "session_fork", parent_id, new_id, branch_name}`. ~30 lines.
+     3. *Implement `/session delete <id> [--force]`.* Call `SessionStore::delete_managed_session` (honoring `--force` to skip confirmation). Return `{kind: "session_deleted", deleted_id, backup_path?}`. ~30 lines. `--force` is required without a TTY since confirmation stdin prompts are non-answerable.
+     4. *Add `claw session <verb>` CLI subcommand.* Parse at `parse_args` before the Prompt fallthrough. Route to the same handlers. Provides a cleaner entry point than slash-via-`--resume`. ~40 lines.
+     5. *Update help to document what works from --resume vs REPL-only.* Currently the slash-command docs don't annotate which verbs are resume-compatible. Add `[resume-safe]` markers per subverb. ~5 lines.
+     6. *Regression tests.* One per verb × (CLI subcommand / slash-via-resume). Validate structured JSON output shape. Assert `/session delete s` without `--force` in non-TTY returns a structured `confirmation_required` error rather than blocking on stdin.
+
+     **Acceptance.** `claw --resume s --output-format json /session delete old-id --force` exits with `{kind: "session_deleted", ...}` instead of "unsupported resumed slash command." `claw session fork <id> feature-branch` works as a top-level CLI subcommand. `claw --help` clearly annotates which session verbs are programmatically accessible vs REPL-only. Zero "REPL-only" features are advertised as universally available without that marker.
+
+     **Blocker.** None. Backing `SessionStore` methods all exist (`delete_managed_session`, `fork_managed_session`, `resolve_reference`). This is dispatch-plumbing + CLI-parser wiring. Total ~130 lines + tests.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdJJ` on main HEAD `8b25daf` in response to Clawhip pinpoint nudge at `1494887723818029156`. Joins **Unplumbed-subsystem / declared-but-not-delivered** (#78, #96, #100, #102, #103, #107, #109, #111) as the ninth surface where spec advertises capability the implementation doesn't deliver on the machine-readable path. Joins **Session-handling** (#93, #112) — with #113, this cluster now covers reference-resolution semantics + concurrent-modification + programmatic management gap. Cross-cluster with **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111) on the help-vs-implementation-mismatch axis. Natural bundle: **#93 + #112 + #113** — session-handling triangle covering every axis (semantic / concurrency / management API). Also **#78 + #111 + #113** — declared-but-not-delivered triangle showing three distinct flavors: #78 fails-noisy (CLI variant → Prompt fallthrough), #111 fails-quiet (slash → wrong handler), **#113** no-handler-at-all (slash → unsupported-resumed error). Session tally: ROADMAP #113.
