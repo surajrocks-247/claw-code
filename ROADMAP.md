@@ -3178,3 +3178,80 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. `project_root_for` helper trivially reusable from the git-root walker. Discovery list is additive — adding ancestor entries doesn't break existing cwd-anchored configs. Most invasive piece is the architectural decision: walk-to-project-root + cwd-overlay (this proposal), or walk-every-ancestor-like-CLAUDE.md (#85's current over-broad policy), or unify both under a single policy.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdGG/nested/deep/dir` on main HEAD `16244ce` in response to Clawhip pinpoint nudge at `1494865079567519834`. Joins **truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107, #109) — doctor reports "ok, defaults active" when the operator actually has a config. Joins **discovery-overreach / security-shape** (#85, #88) as the opposite-direction sibling: #85 over-discovers instruction files; #110 under-discovers config files. Cross-cluster with **Reporting-surface / config-hygiene** (#90, #91, #92) — this is the canonical config-discovery policy bug. Natural bundle: **#85 + #110** — unify ancestor-discovery policy across CLAUDE.md + config. Also **#85 + #88 + #110** as the three-way "ancestor-walk policy audit" covering skills over-discovery, CLAUDE.md prompt injection via ancestors, and config under-discovery from subdirectories. Session tally: ROADMAP #110.
+
+111. **`/providers` slash command is documented as "List available model providers" in both `--help` and the shared command-spec registry, but its parser at `commands/src/lib.rs:1386` maps it to `SlashCommand::Doctor` — so invoking `/providers` runs the six-check health report (auth/config/install_source/workspace/sandbox/system) and returns `{kind: "doctor", checks: [...]}`. A claw expecting a structured list of `{providers: [{name, models, base_url, reachable}]}` gets workspace-health JSON instead** — dogfooded 2026-04-18 on main HEAD `b2366d1` from `/tmp/cdHH`. The command-spec registry at `commands/src/lib.rs:716-718` declares `name: "providers", summary: "List available model providers"`. `--help` echoes that summary in the slash-command listing and in the Resume-safe line. Actual dispatch routes to doctor. Declared contract and implementation diverge completely; this is a specification mismatch rather than a stub — `/providers` has documented semantics claw does not implement and silently delivers the wrong subsystem.
+
+     **Concrete repro.**
+     ```
+     $ cd /tmp/cdHH && git init -q .
+     $ # set up a minimal session
+     $ claw --resume s --output-format json /providers | jq '.kind'
+     "doctor"
+     $ # A /providers call returns kind=doctor with six health checks
+     $ claw --resume s --output-format json /providers | jq '.checks[].name'
+     "auth"
+     "config"
+     "install source"
+     "workspace"
+     "sandbox"
+     "system"
+     # No `providers` array. No provider list. Auth/config/etc health checks.
+
+     $ # Compare help documentation:
+     $ claw --help | grep '/providers'
+       /providers                 List available model providers [resume]
+     # Help advertises provider listing. Implementation delivers doctor.
+
+     # Also compare: /tokens and /cache alias to SlashCommand::Stats, which IS
+     # reasonable — Stats contains token + cache counts. Those aliases are
+     # semantically close. /providers → Doctor is not.
+     $ claw --resume s --output-format json /tokens | jq '.kind'
+     "stats"
+     # Reasonable: Stats has token counts.
+     $ claw --resume s --output-format json /cache | jq '.kind'
+     "stats"
+     # Reasonable: Stats has cache counts.
+     ```
+
+     **Trace path.**
+     - `rust/crates/commands/src/lib.rs:716-720` — command-spec registry:
+       ```rust
+       SlashCommandSpec {
+           name: "providers",
+           aliases: &[],
+           summary: "List available model providers",
+           argument_hint: None,
+           ...
+       }
+       ```
+     - `rust/crates/commands/src/lib.rs:1386` — parser:
+       ```rust
+       "doctor" | "providers" => {
+           validate_no_args(command, &args)?;
+           SlashCommand::Doctor
+       }
+       ```
+       Both `/doctor` and `/providers` collapse to `SlashCommand::Doctor`. The registry-declared semantics for `/providers` ("list available model providers") is never honored.
+     - `rust/crates/rusty-claude-cli/src/main.rs` — `render_providers_report` / `render_providers_json` / any provider-listing code: **does not exist**. Verified via `grep -rn "fn render_providers\|fn list_providers\|pub fn providers" rust/crates/ | head` — zero matches.
+     - Runtime DOES know about providers conceptually — `rust/crates/rusty-claude-cli/src/main.rs:1143-1147` enumerates `ProviderKind::Anthropic`, `Xai`, etc. for prefix-routing model names. `resolve_repl_model` + provider-prefix logic has provider awareness. None of it is surfaced through a command.
+
+     **Why this is specifically a clawability gap.**
+     1. *Declared-but-not-implemented contract mismatch.* Unlike #96's `STUB_COMMANDS` entries (where the infrastructure says "not yet implemented"), `/providers` silently succeeds with the WRONG output. A claw parsing `{kind: "providers", providers: [...]}` from the documented spec gets `{kind: "doctor", checks: [...]}` instead — same top-level `kind` field name, completely different payload shape.
+     2. *Help text lies twice.* The standalone slash-command line in `--help` says "List available model providers." The Resume-safe summary also includes `/providers` (passes the #96 filter because it IS implemented — just as the wrong handler). A claw reading either surface cannot know the command is mis-wired without running it.
+     3. *Runtime has provider data.* `ProviderKind::{Anthropic,Xai,OpenAi,...}`, `resolve_repl_model`, provider-prefix routing, and `pricing_for_model` all know about providers. A real `/providers` implementation would have input from `ProviderKind` + any configured `providerFallbacks` array + env vars. ~20 lines. The scaffolding is present.
+     4. *Parallel to #78 (CLI route never constructed).* #78 says `claw plugins` CLI route is wired as a `CliAction` variant but falls through to Prompt. #111 says `/providers` slash command is wired as a `SlashCommandSpec` entry but dispatches to the wrong handler. Both are "declared in the spec, not actually implemented as declared." #78 fails noisily (prompt-fallthrough error); #111 fails quietly (returns a different subsystem's output).
+     5. *Joins the Silent-flag / documented-but-unenforced cluster* on a new axis: documentation-vs-implementation mismatch at the command-dispatch layer.
+     6. *Test coverage blind spot.* A unit test that asserts `claw --resume s /providers` returns `kind: "doctor"` would PASS today — which means the current test suite (if any covers /providers) is locking in the bug.
+
+     **Fix shape — either implement /providers properly or remove it from the spec + help.**
+     1. *Option A — implement.* Add a `SlashCommand::Providers` variant. Build a `render_providers_json(runtime_config) -> json!({ kind: "providers", providers: [{name, base_url_env, active, has_credentials, ...}] })` helper from the existing `ProviderKind` enum + `provider_fallbacks` config + env-var inspection. Add to the `run_resume_command` match. ~60 lines.
+     2. *Option B — remove.* Delete the `"providers"` name from the command-spec registry. Remove `"providers"` from the parser arm. `/providers` becomes an unknown slash command and gets the "Did you mean /doctor?" suggestion. ~3 lines of deletion.
+     3. *Either way, fix `--help`.* If implemented (Option A), the current help text is correct. If removed (Option B), delete the help line.
+     4. *Regression test.* Assert `/providers` returns `kind: "providers"` (Option A) or returns "unknown slash command" error (Option B). Either way, prevent the current silent-wrong-subsystem behavior.
+     5. *Cross-check.* Audit the rest of the registry for other mismatches. `/tokens → Stats` and `/cache → Stats` are semantically defensible (stats contains what the user asked for). Any other parser arms that collapse disparate commands into a single handler are candidates for the same audit.
+
+     **Acceptance.** `claw --resume s /providers` returns either `{kind: "providers", providers: [...]}` (Option A) or exits with structured error `unknown slash command: /providers. Did you mean /doctor?` (Option B). The `--help` line for `/providers` matches actual behavior. Test suite locks in the chosen semantic.
+
+     **Blocker.** None. The choice (implement vs remove) is the only architectural decision. Runtime has enough scaffolding that implementing is ~60 lines. Removing is ~3 lines.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdHH` on main HEAD `b2366d1` in response to Clawhip pinpoint nudge at `1494872623782301817`. Joins **silent-flag / documented-but-unenforced** (#96–#101, #104, #108) on the command-dispatch-semantics axis — eighth instance of "documented behavior differs from actual." Joins **unplumbed-subsystem / CLI-advertised-but-unreachable** (#78, #96, #100, #102, #103, #107, #109) as the eighth surface where the spec advertises a capability the implementation doesn't deliver. Joins **truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107, #109, #110) — `/providers` silently returns doctor output under the wrong kind label; help lies about capability. Natural bundle: **#78 + #96 + #111** — three-way "declared but not implemented as declared" triangle (CLI route never constructed + help resume-safe leaks stubs + slash command dispatches to wrong handler). Also **#96 + #108 + #111** — full `--help`/dispatch surface hygiene quartet covering help-filter-leaks + subcommand typo fallthrough + slash-command mis-dispatch. Session tally: ROADMAP #111.
