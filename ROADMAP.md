@@ -3704,3 +3704,99 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** Policy decision: does the project want strict-by-default (current) or lax-by-default? The fix shape assumes lax-by-default with strict opt-in, matching industry-standard forward-compat conventions and easing Claude Code migration.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdRR` on main HEAD `ad02761` in response to Clawhip pinpoint nudge at `1494925472239321160`. Joins **Claude Code migration parity** (#103, #109) as 3rd member — this is the most severe migration-parity break, since it's a HARD FAIL at startup rather than a silent drop (#103) or a stderr-prose warning (#109). Joins **Reporting-surface / config-hygiene** (#90, #91, #92, #110, #115) on the error-routing-vs-stdout axis: `--output-format json` consumers get empty stdout on config errors. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115) because only the first error is reported and all subsequent errors are silent. Cross-cluster with **Truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107, #109, #110, #112, #114, #115) because `validation.is_ok()` hides all-but-the-first structured problem. Natural bundle: **#103 + #109 + #116** — Claude Code migration parity triangle: `claw agents` drops `.md` (loss of compatibility) + config warnings stderr-prose (loss of structure) + config unknowns hard-fail (loss of forward-compat). Also **#109 + #116** — config validation reporting surface: only first warning surfaces structurally (#109) + only first error surfaces structurally and halts loading (#116). Session tally: ROADMAP #116.
+
+117. **`-p` (Claude Code compat shortcut for "prompt") is super-greedy: the parser at `main.rs:524-538` does `let prompt = args[index + 1..].join(" ")` and immediately returns, swallowing EVERY subsequent arg into the prompt text. `--model sonnet`, `--output-format json`, `--help`, `--version`, and any other flag placed AFTER `-p` are silently consumed into the prompt that gets sent to the LLM. Flags placed BEFORE `-p` are also dropped when parser-state variables like `wants_help` are set and then discarded by the early `return Ok(CliAction::Prompt {...})`. The emptiness check (`if prompt.trim().is_empty()`) is too weak: `claw -p --model sonnet` produces prompt=`"--model sonnet"` which is non-empty, so no error is raised and the literal flag string is sent to the LLM as user input** — dogfooded 2026-04-18 on main HEAD `f2d6538` from `/tmp/cdSS`.
+
+     **Concrete repro.**
+     ```
+     # Test: -p swallows --help (which should short-circuit):
+     $ claw -p "test" --help
+     # Expected: help output (--help short-circuits)
+     # Actual: tries to run prompt "test --help" — sends it to LLM
+     error: missing Anthropic credentials ...
+
+     # Test: --help BEFORE -p is silently discarded:
+     $ claw --help -p "test"
+     # Expected: help output (--help seen first)
+     # Actual: tries to run prompt "test" — wants_help=true was set, then discarded
+     error: missing Anthropic credentials ...
+
+     # Test: -p swallows --version:
+     $ claw -p "test" --version
+     # Expected: version output
+     # Actual: tries to run prompt "test --version"
+
+     # Test: -p with actual credentials — the SWALLOWING is visible:
+     $ ANTHROPIC_AUTH_TOKEN=sk-bogus claw -p "hello" --model sonnet
+     7[1G[2K[38;5;12m⠋ 🦀 Thinking...[0m8[1G[2K[38;5;9m✘ ❌ Request failed
+     error: api returned 401 Unauthorized (authentication_error)
+     # The 401 comes back AFTER the request went out. The --model sonnet was
+     # swallowed into the prompt "hello --model sonnet", the binary's default
+     # model was used (not sonnet), and the bogus token hit auth failure.
+
+     # Test: prompt-starts-with-flag sneaks past emptiness check:
+     $ claw -p --model sonnet
+     error: missing Anthropic credentials ...
+     # prompt = "--model sonnet" (non-empty, so check passes).
+     # No "-p requires a prompt string" error.
+     # The literal string "--model sonnet" is sent to the LLM.
+     ```
+
+     **Trace path.**
+     - `rust/crates/rusty-claude-cli/src/main.rs:524-538` — the `-p` branch:
+       ```rust
+       "-p" => {
+           // Claw Code compat: -p "prompt" = one-shot prompt
+           let prompt = args[index + 1..].join(" ");
+           if prompt.trim().is_empty() {
+               return Err("-p requires a prompt string".to_string());
+           }
+           return Ok(CliAction::Prompt {
+               prompt,
+               model: resolve_model_alias_with_config(&model),
+               output_format,
+               ...
+           });
+       }
+       ```
+       The `args[index + 1..].join(" ")` is the greedy absorption. The `return Ok(...)` short-circuits the parser loop, discarding any parser state set by earlier iterations.
+     - `rust/crates/rusty-claude-cli/src/main.rs:403` — `let mut wants_help = false;` declared but can be set and immediately dropped if `-p` returns.
+     - `rust/crates/rusty-claude-cli/src/main.rs:415-418` — `"--help" | "-h" if rest.is_empty() => { wants_help = true; index += 1; }`. The `-p` branch doesn't consult `wants_help` before returning.
+     - `rust/crates/rusty-claude-cli/src/main.rs:524-528` — emptiness check: `if prompt.trim().is_empty()`. Fails only on totally-empty joined string. `-p --foo` produces `"--foo"` which passes.
+     - Compare Claude Code's `-p`: `claude -p "prompt"` takes exactly ONE positional arg, subsequent flags are parsed normally. claw-code's `-p` is greedy and short-circuits the rest of the parser.
+     - The short-circuit also means flags set AFTER `-p` (e.g. `-p "text" --output-format json`) that actually do end up in the Prompt struct (like `output_format`) only work if they appear BEFORE `-p`. Anything after is swallowed.
+
+     **Why this is specifically a clawability gap.**
+     1. *Silent prompt corruption.* A claw building a command line via string concatenation ends up sending the literal string `"--model sonnet --output-format json"` to the LLM when that string is appended after `-p`. The LLM gets garbage prompts that weren't what the user/orchestrator meant. Billable tokens burned on corrupted prompts.
+     2. *Flag order sensitivity is invisible.* Nothing in `--help` warns that flags must be placed BEFORE `-p`. Users and claws try `-p "prompt" --model sonnet` based on Claude Code muscle memory and get silent misbehavior.
+     3. *`--help` and `--version` short-circuits are defeated.* `claw -p "test" --help` should print help. Instead it tries to run the prompt "test --help". `claw --help -p "test"` (flag-first) STILL tries to run the prompt — `wants_help` is set but dropped on -p's return. Help is inaccessible when -p is in the command line.
+     4. *Emptiness check too weak.* `-p --foo` produces prompt `"--foo"` which the check considers non-empty. So no guard. A claw or shell script that conditionally constructs `-p "$PROMPT" --output-format json` where `$PROMPT` is empty or missing silently sends `"--output-format json"` as the user prompt.
+     5. *Joins truth-audit.* The parser is lying about what it parsed. Presence of `--model sonnet` in the args does NOT mean the model got set. Depending on order, the same args produce different parse outcomes. A claw inspecting its own argv cannot predict behavior from arg composition alone.
+     6. *Joins parallel-entry-point asymmetry.* `-p "prompt"` and `claw prompt TEXT` and bare positional `claw TEXT` are three entry points to the same Prompt action. Each has different arg-parsing semantics. Inconsistent.
+     7. *Joins Claude Code migration parity.* `claude -p "..." --model ..."` works in Claude Code. The same command in claw-code silently corrupts the prompt. Users migrating get mysterious wrong-model-used or garbage-prompt symptoms.
+     8. *Combined with #108 (subcommand typos fall through to Prompt).* A typo like `claw -p helo --model sonnet` gets sent as "helo --model sonnet" to the LLM AND gets counted against token usage AND gets no warning. Two bugs compound: typo + swallow.
+
+     **Fix shape — `-p` takes exactly one argument, subsequent flags parse normally.**
+     1. *Take only `args[index + 1]` as the prompt; continue parsing afterward.* ~10 lines.
+       ```rust
+       "-p" => {
+           let prompt = args.get(index + 1).cloned().unwrap_or_default();
+           if prompt.trim().is_empty() || prompt.starts_with('-') {
+               return Err("-p requires a prompt string (use quotes for multi-word prompts)".to_string());
+           }
+           pending_prompt = Some(prompt);
+           index += 2;
+       }
+       ```
+       Then after the loop, if `pending_prompt.is_some()` and `rest.is_empty()`, build the Prompt action with the collected flags.
+     2. *Handle the emptiness check rigorously.* Reject prompts that start with `-` (likely a flag) with an error: `-p appears to be followed by a flag, not a prompt. Did you mean '-p "<prompt>"' or '-p -- -flag-as-prompt'?` ~5 lines.
+     3. *Support the `--` separator.* `claw -p -- --model` lets users opt into a literal `--model` string as the prompt. ~5 lines.
+     4. *Consult `wants_help` before returning.* If `wants_help` was set, print help regardless of -p. ~3 lines.
+     5. *Deprecate the current greedy behavior with a runtime warning.* For one release, detect the old-style invocation (multiple args after `-p` with some looking flag-like) and emit: `warning: "-p" absorption changed. See CHANGELOG.` ~15 lines.
+     6. *Regression tests.* (a) `-p "prompt" --model sonnet` uses sonnet model. (b) `-p "prompt" --help` prints help. (c) `-p --foo` errors out. (d) `--help -p "test"` prints help. (e) `claw -p -- --literal-prompt` sends "--literal-prompt" to the LLM.
+
+     **Acceptance.** `-p "prompt"` takes exactly ONE argument. Subsequent `--model`, `--output-format`, `--help`, `--version`, `--permission-mode`, etc. are parsed normally. `claw -p "test" --help` prints help. `claw -p --model sonnet` errors out with a message explaining flag-like prompts require `--`. `claw --help -p "test"` prints help. Token-burning silent corruption is impossible.
+
+     **Blocker.** None. Parser refactor is localized to one arm. Compatibility concern: anyone currently relying on `-p` greedy absorption (unlikely because it's silently-broken) would see a behavior change. Deprecation warning for one release softens the transition.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdSS` on main HEAD `f2d6538` in response to Clawhip pinpoint nudge at `1494933025857736836`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116) as 12th member — `-p` is an undocumented-in-`--help` shortcut whose silent greedy behavior makes flag-order semantics invisible. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114) as 7th — three entry points (`claw prompt TEXT`, bare positional `claw TEXT`, `claw -p TEXT`) with subtly different arg-parsing semantics. Joins **Truth-audit** — the parser is lying about what it parsed when `-p` is present. Joins **Claude Code migration parity** (#103, #109, #116) as 4th — users migrating `claude -p "..." --model ..."` silently get corrupted prompts. Cross-cluster with **Silent-flag** quartet (#96, #98, #108, #111) now quintet: #108 (subcommand typos fall through to Prompt, burning billed tokens) + **#117** (prompt flags swallowed into prompt text, ALSO burning billed tokens) — both are silent-token-burn failure modes. Natural bundle: **#108 + #117** — billable-token silent-burn pair: typo fallthrough + flag-swallow. Also **#105 + #108 + #117** — model-resolution triangle: `claw status` ignores .claw.json model (#105) + typo'd `claw statuss` burns tokens (#108) + `-p "test" --model sonnet` silently ignores the model (#117). Session tally: ROADMAP #117.
