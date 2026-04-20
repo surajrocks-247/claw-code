@@ -711,7 +711,21 @@ Acceptance:
 - token-risk preflight becomes operational guidance, not just warning text
 - first-run users stop getting stuck between diagnosis and manual cleanup
 
-### 4.44.5. Ship/provenance opacity — branch → merge → main-push boundary not first-class
+### 4.44.5. Ship/provenance opacity — IMPLEMENTED 2026-04-20
+
+**Status:** Events implemented in `lane_events.rs`. Surface now emits structured ship provenance.
+
+When dogfood work lands on `main`, the delivery path (scoped branch → PR → merge → push vs direct push) and the exact commit set shipped are not surfaced as first-class events. This makes it too easy to lose the boundary between "dogfood fix landed", "what exact commits shipped", and "what review/merge path was actually used." The 56-commit push during 2026-04-20 dogfood (#122/#127/#129/#130/#131/#132) exhibited this gap: work started as scoped pinpoint branches, then collapsed into a direct `origin/main` push with no structured provenance trail.
+
+**Implemented behavior:**
+- `ship.prepared` event — intent to ship established
+- `ship.commits_selected` event — commit range locked
+- `ship.merged` event — merge completed with metadata
+- `ship.pushed_main` event — delivery to main confirmed
+- All carry `ShipProvenance { source_branch, base_commit, commit_count, commit_range, merge_method, actor, pr_number }`
+- `ShipMergeMethod` enum: direct_push, fast_forward, merge_commit, squash_merge, rebase_merge
+
+Required behavior:
 
 When dogfood work lands on `main`, the delivery path (scoped branch → PR → merge → push vs direct push) and the exact commit set shipped are not surfaced as first-class events. This makes it too easy to lose the boundary between "dogfood fix landed", "what exact commits shipped", and "what review/merge path was actually used." The 56-commit push during 2026-04-20 dogfood (#122/#127/#129/#130/#131/#132) exhibited this gap: work started as scoped pinpoint branches, then collapsed into a direct `origin/main` push with no structured provenance trail.
 
