@@ -4594,3 +4594,99 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. Section branching in the handler.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdFF2` on main HEAD `b56841c` in response to Clawhip pinpoint nudge at `1495023618529300580`. Joins **Silent-flag / documented-but-unenforced** — section argument silently ignored. Joins **Truth-audit** — help promises section-specific inspection that doesn't exist. Joins **Dispatch-collapse family**: #111 (2-way) + #118 (3-way) + **#126** (4-way). Natural bundle: **#111 + #118 + #126** — dispatch-collapse trio: complete parser-dispatch-collapse audit across slash commands. Session tally: ROADMAP #126.
+
+127. **`claw <subcommand> --json` and `claw <subcommand> <ANY-EXTRA-ARG>` silently fall through to LLM Prompt dispatch — every diagnostic verb (`doctor`, `status`, `sandbox`, `skills`, `version`, `help`) accepts the documented `--output-format json` global only BEFORE the subcommand. The natural shape `claw doctor --json` parses as: subcommand=`doctor` is consumed, then `--json` becomes prompt text, the parser dispatches to `CliAction::Prompt { prompt: "--json" }`, the prompt path demands Anthropic credentials, and a fresh box with no auth fails hard with exit=1. Same for `claw doctor --garbageflag`, `claw doctor garbage args here`, `claw status --json`, `claw skills --json`, etc. The text-mode form `claw doctor` works fine without auth (it's a pure local diagnostic), so this is a pure CLI-surface failure that breaks every observability tool that pipes JSON. README.md says "`claw doctor` should be your first health check" — but any claw, CI step, or monitoring tool that adds `--json` to that exact suggested command gets a credential-required error instead of structured output** — dogfooded 2026-04-20 on main HEAD `7370546` from `/tmp/claw-dogfood` (no `.git`, no `.claw.json`, all `ANTHROPIC_*` / `OPENAI_*` env vars unset via `env -i`).
+
+     **Concrete repro.**
+     ```
+     # Text doctor works (no auth needed — pure local diagnostic):
+     $ env -i PATH=$PATH HOME=$HOME claw doctor
+     Doctor
+     Summary
+       OK               3
+       Warnings         3
+       Failures         0
+     ...
+     # exit=0
+
+     # Subcommand-suffix --json fails hard:
+     $ env -i PATH=$PATH HOME=$HOME claw doctor --json
+     error: missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY
+     # exit=1
+
+     # Same for status / sandbox / skills / version / help:
+     $ env -i PATH=$PATH HOME=$HOME claw status --json     # exit=1, cred error
+     $ env -i PATH=$PATH HOME=$HOME claw sandbox --json    # exit=1, cred error
+     $ env -i PATH=$PATH HOME=$HOME claw skills --json     # exit=1, cred error
+     $ env -i PATH=$PATH HOME=$HOME claw version --json    # exit=1, cred error
+     $ env -i PATH=$PATH HOME=$HOME claw help --json       # exit=1, cred error
+
+     # Subcommand-suffix garbage flags fall through too:
+     $ env -i PATH=$PATH HOME=$HOME claw doctor --garbageflag
+     error: missing Anthropic credentials ...
+     # exit=1 — "--garbageflag" silently became prompt text
+
+     # Subcommand-suffix garbage positional args fall through too:
+     $ env -i PATH=$PATH HOME=$HOME claw doctor garbage args here
+     error: missing Anthropic credentials ...
+     # exit=1 — "garbage args here" silently became prompt text
+
+     # Documented form (--output-format json BEFORE subcommand) works:
+     $ env -i PATH=$PATH HOME=$HOME claw --output-format json doctor
+     {
+       "checks": [...],
+       "has_failures": false,
+       "kind": "doctor",
+       ...
+     }
+     # exit=0
+
+     # Subcommand-prefix --output-format json also works:
+     $ env -i PATH=$PATH HOME=$HOME claw doctor --output-format json
+     {
+       "checks": [...]
+     }
+     # exit=0 — so the verb DOES tolerate post-positional args, but only the
+     # specific token "--output-format" + value, NOT the convention shorthand "--json".
+     ```
+
+     **The actual ANTHROPIC_API_KEY-set demonstration of the silent token burn.**
+     With provider creds configured, `claw doctor --json` does not error — it sends the literal string `"--json"` to the LLM as a prompt and bills tokens against it. The `claw doctor --garbageflag` case sends `"--garbageflag"` as a prompt. The bug is invisible in CI logs because the Doctor envelope is never emitted; the LLM just answers a question it didn't expect. (Verified via the same fall-through arm documented at #108 / #117.)
+
+     **Trace path.**
+     - Subcommand dispatch in `rust/crates/rusty-claude-cli/src/main.rs` consumes the verb token (`doctor`, `status`, etc.) and constructs `CliAction::Doctor { ... }` / `CliAction::Status { ... }` from the remaining args — but the verb-specific arg parser only knows about `--output-format` (the explicit canonical form) and treats every other token as positional prompt text once it falls through.
+     - The same `_other => Ok(CliAction::Prompt { ... })` fall-through arm that #108 identifies for typoed verbs (`claw doctorr`) also fires for **valid verb + unrecognized suffix arg** (`claw doctor --json`).
+     - Compare to the `--output-format json` global flag, which is parsed in the global flag pre-pass at `main.rs:415-418` style logic, before subcommand dispatch — so `claw --output-format json doctor` and `claw doctor --output-format json` both work, but `claw doctor --json` does not. The convention shorthand `--json` (used by `cargo`, `kubectl`, `gh`, `aws` etc.) is unrecognized.
+     - The `system-prompt` verb has its own per-verb parser that explicitly rejects `--json` with `error: unknown system-prompt option: --json` (exit=1) instead of falling through — so the surface is **inconsistent**: `system-prompt` rejects loudly, all other diagnostic verbs reject silently via cred-error misdirection.
+
+     **Why this is specifically a clawability gap.**
+     1. *README.md's first-health-check command is broken for JSON consumers.* The README says "Make `claw doctor` your first health check after building" and the canonical flag for structured output is `--json`. Every monitoring/observability tool that wraps `claw doctor` to parse JSON output gets a credential-error masquerade instead of structured data on a fresh box.
+     2. *Pure local diagnostic verbs require API creds in JSON mode.* `doctor`, `status`, `sandbox`, `skills`, `version`, `help` are all read-only and gather purely local information. Demanding Anthropic creds for `version --json` is absurd. The text form proves no creds are needed; the JSON form pretends they are.
+     3. *Cred-error misdirection is the worst kind of error.* A claw seeing "missing Anthropic credentials" on `claw doctor --json` fixes the wrong thing — it adds creds, retries, the same misdirection happens for any other suffix arg, and the actual cause (silent argv fall-through) is invisible. The error message doesn't say "`--json` is not a recognized doctor flag — did you mean `--output-format json`?"
+     4. *Inconsistent per-verb suffix-arg handling.* `system-prompt --json` rejects with exit=1 and a clear message. `doctor --json` falls through to Prompt dispatch with a credential error. Same surface, two different failure modes. Six other verbs follow the silent fall-through.
+     5. *Joins #108 (subcommand typos fall through to Prompt).* #108 catches `claw doctorr` (typoed verb). #127 catches `claw doctor --json` (valid verb + unrecognized suffix). Same fall-through arm, different entry case.
+     6. *Joins #117 (`-p` greedy swallow).* #117 catches `-p` swallowing subsequent flags into prompt. #127 catches subcommand verbs swallowing subsequent flags into prompt. Same shape (silent prompt corruption from positional-eager parsing), different verb set. With API creds configured, the literal token `"--json"` is sent to the LLM as a prompt — same billable-token-burn pathology.
+     7. *Joins truth-audit / diagnostic-integrity (#80–#87, #89, #100, #102, #103, #105, #107, #109, #110, #112, #114, #115, #125).* The CLI lies about what flags it accepts. `claw --help` shows global `--output-format json` but no per-subcommand flag manifest. A claw inspecting `--help` cannot infer that `claw doctor --json` will silently fail.
+     8. *Joins parallel-entry-point asymmetry (#91, #101, #104, #105, #108, #114, #117, #122, #123, #124).* Three working forms (`claw --output-format json doctor`, `claw doctor --output-format json`, `claw -p "..." --output-format json` with explicit prefix) and one broken form (`claw doctor --json`). A claw building a CLI invocation has to know which arg-position works.
+     9. *Compounds with CI/automation.* `for v in doctor status sandbox; do claw $v --json | jq ...; done` — every iteration silently fails on a fresh box, jq gets stderr, the loop continues, no claw notices until the parsed JSON is empty.
+
+     **Fix shape (~80 lines across two files).**
+     1. *Add `--json` as a recognized per-subcommand alias for `--output-format json` in every diagnostic verb's arg parser* (`doctor`, `status`, `sandbox`, `skills`, `version`, `help`). ~6 lines per verb, 6 verbs = ~36 lines.
+     2. *Reject unknown post-subcommand args loudly with `error: unknown <verb> option: <arg>` mirroring the `system-prompt` precedent at `rust/crates/rusty-claude-cli/src/main.rs` (exact line in `system-prompt` handler).* Do not fall through to Prompt dispatch when the first positional was a recognized verb. ~20 lines (one per-verb tail-arg validator + did-you-mean for nearby flag names).
+     3. *Special-case suggestion: when an unknown post-subcommand arg matches `--json` literally, suggest `--output-format json` in the error message.* ~5 lines.
+     4. *Update help text to surface per-subcommand flags inline* (e.g. `claw doctor [--json|--output-format FORMAT]`) so the `--help` output is no longer silent about which flags each verb accepts. ~10 lines.
+     5. *Regression tests.*
+        - (a) `claw doctor --json` exits 0 and emits doctor JSON envelope on stdout.
+        - (b) `claw doctor --garbageflag` exits 1 with `error: unknown doctor option: --garbageflag` (no cred error, no Prompt dispatch).
+        - (c) `claw doctor garbage` exits 1 with `error: unknown doctor argument: garbage` (no Prompt fall-through).
+        - (d) `claw status --json`, `claw sandbox --json`, `claw skills --json`, `claw version --json`, `claw help --json` all exit 0 and emit JSON.
+        - (e) `claw system-prompt --json` continues to reject (already correct, just lock the behavior in regression).
+        - (f) `claw --output-format json doctor` and `claw doctor --output-format json` both continue to work (no regression).
+        - (g) With `ANTHROPIC_API_KEY` set, `claw doctor --json` does NOT make an LLM request (no token burn).
+     6. *No-regression check on Prompt dispatch:* `claw "some prompt text"` (bare positional, no recognized verb) still falls through to Prompt dispatch correctly. The fix only changes behavior when the FIRST positional was a recognized subcommand verb.
+
+     **Acceptance.** `env -i PATH=$PATH HOME=$HOME claw doctor --json` exits 0 and emits the doctor JSON envelope on stdout (matching `claw --output-format json doctor`). `claw doctor --garbageflag` exits 1 with a clear unknown-option error and does NOT attempt an LLM call. With API creds configured, `claw doctor --garbageflag` also does NOT burn billable tokens. The README's first-health-check guidance works for JSON consumers without auth.
+
+     **Blocker.** None. Per-verb post-positional validator + `--json` alias. ~80 lines across `rust/crates/rusty-claude-cli/src/main.rs` and the per-verb dispatch sites.
+
+     **Source.** Jobdori dogfood 2026-04-20 against `/tmp/claw-dogfood` (env-cleaned, no git, no config) on main HEAD `7370546` in response to Clawhip pinpoint nudge at `1495620050424434758`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118, #119, #121, #122, #123, #124, #126) as 18th — `--json` silently swallowed into Prompt dispatch instead of being recognized or rejected. Joins **Parser-level trust gap quintet** (#108, #117, #119, #122, **#127**) as 5th — same `_other => Prompt` fall-through arm, fifth distinct entry case (#108 = typoed verb, #117 = `-p` greedy, #119 = bare slash + arg, #122 = `--base-commit` greedy, **#127 = valid verb + unrecognized suffix arg**). Joins **Cred-error misdirection / failure-classification gaps** as a sibling of #99 (system-prompt unvalidated) — same family of "local diagnostic verb pretends to need API creds." Joins **Truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107, #109, #110, #112, #114, #115, #125) — `claw --help` lies about per-verb accepted flags. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117, #122, #123, #124) as 11th — three working forms and one broken form for the same logical intent (`--json` doctor output). Joins **Claude Code migration parity** (#103, #109, #116) as 4th — Claude Code's `--json` convention shorthand is unrecognized in claw-code's verb-suffix position; users migrating get cred errors instead. Cross-cluster with **README/USAGE doc-vs-implementation gap** — README explicitly recommends `claw doctor` as the first health check; the natural JSON form of that exact command is broken. Natural bundle: **#108 + #117 + #119 + #122 + #127** — parser-level trust gap quintet: complete `_other => Prompt` fall-through audit (typoed verb + greedy `-p` + bare slash-verb + greedy `--base-commit` + valid verb + unrecognized suffix). Also **#99 + #127** — local-diagnostic cred-error misdirection pair: `system-prompt` and verb-suffix `--json` both pretend to need creds for pure-local operations. Also **#126 + #127** — diagnostic-verb surface integrity pair: `/config` section args ignored (#126) + verb-suffix args silently mis-dispatched (#127). Session tally: ROADMAP #127.
