@@ -1508,10 +1508,7 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
             check_sandbox_health(&context.sandbox_status),
             check_system_health(&cwd, config.as_ref().ok()),
         ],
-    });
-    // Run stale-base preflight check — emits warnings to stderr if branch is behind main
-    run_stale_base_preflight(None);
-    Ok(report)
+    })
 }
 
 fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
