@@ -4693,6 +4693,80 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
 128. **`claw --model <malformed>` (spaces, empty string, special chars, invalid provider/model syntax) silently falls through to API-layer cred error instead of rejecting at parse time** — dogfooded 2026-04-20 on main HEAD `d284ef7` from a fresh environment (no config, no auth). The `--model` flag accepts any string without syntactic validation: spaces (`claw --model "bad model"`), empty strings (`claw --model ""`), special characters (`claw --model "@invalid"`), non-existent provider/model combinations all parse successfully. The malformed model string then flows into the runtime's provider-detection layer, which silently accepts it as Anthropic fallback or passes it to an API layer that fails with `missing Anthropic credentials` (misdirection) rather than a clear "invalid model syntax" error at parse time. With API credentials configured, a malformed model string gets sent to the API, billing tokens against a request that should have failed client-side.
 
+129. **MCP server startup blocks credential validation — `claw <prompt>` with any `.claw.json` `mcpServers` entry awaits the MCP server's stdio handshake BEFORE checking whether the operator has Anthropic credentials. With no `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` set and `mcpServers.everything = { command: "npx", args: ["-y", "@modelcontextprotocol/server-everything"] }` configured, the CLI hangs forever (verified via `timeout 30s` — still in MCP startup at 30s with three repeated `"Starting default (STDIO) server..."` lines), instead of fail-fasting with the same `missing Anthropic credentials` error that fires in milliseconds when no MCP is configured. A misconfigured-but-running MCP server (one that spawns successfully but never completes its `initialize` handshake) wedges every `claw <prompt>` invocation permanently. A misconfigured MCP server with a slow-but-eventually-succeeding init (npx download, container pull, network roundtrip) burns startup latency on every Prompt invocation regardless of whether the LLM call would even succeed. This is the runtime-side companion to #102's config-time MCP diagnostic gap: #102 says doctor doesn't surface MCP reachability; #129 says the Prompt path's reachability check is implicit, blocking, retried, and runs *before* the cheaper auth precondition that should run first** — dogfooded 2026-04-20 on main HEAD `d284ef7` from `/tmp/claw-mcp-test` with `env -i PATH=$PATH HOME=$HOME` (all auth env vars unset).
+
+     **Concrete repro.**
+     ```
+     # Baseline (no MCP, no auth) — fail-fast in milliseconds:
+     $ cd /tmp/empty-no-mcp && rm -f .claw.json
+     $ time env -i PATH=$PATH HOME=$HOME claw "what is two plus two"
+     error: missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY ...
+     real    0m0.04s
+
+     # With one working MCP (no auth) — hangs indefinitely:
+     $ cd /tmp/claw-mcp-test
+     $ cat .claw.json
+     {
+       "mcpServers": {
+         "everything": {
+           "command": "npx",
+           "args": ["-y", "@modelcontextprotocol/server-everything"]
+         }
+       }
+     }
+     $ time timeout 30 env -i PATH=$PATH HOME=$HOME claw "what is two plus two"
+     Starting default (STDIO) server...
+     Starting default (STDIO) server...
+     Starting default (STDIO) server...
+     real    0m30.00s        # ← timeout killed it. The cred error never surfaced.
+     # exit=124
+
+     # With one bogus MCP binary (no auth) — fail-fast still works:
+     $ cat .claw.json
+     {"mcpServers": {"bogus": {"command": "/this/does/not/exist", "args": []}}}
+     $ env -i PATH=$PATH HOME=$HOME claw "what is two plus two"
+     error: missing Anthropic credentials ...   # spawn-fail is silent and cheap; cred check still wins
+     # exit=1, fast
+     ```
+
+     **Trace path.**
+     - The Prompt dispatch in `rust/crates/rusty-claude-cli/src/main.rs` enters the runtime initialization sequence which, per #102's `mcp_tool_bridge` work, eagerly spawns every configured MCP server stdio child and awaits its `initialize` handshake before the first `/v1/messages` API call.
+     - The credential-validation guard that emits `error: missing Anthropic credentials` runs during the API call setup phase — AFTER MCP server initialization, not before.
+     - The three repeated `"Starting default (STDIO) server..."` lines in 30s show the MCP child process restart loop — if the child's `initialize` handshake takes longer than the runtime's tool-bridge wait, the runtime restarts the spawn (Lane 7 "MCP lifecycle" in PARITY.md says "merged" but the lifecycle has no startup deadline + cred-precheck ordering).
+     - Compare to `claw doctor` (text-mode), `claw status` (text-mode), `claw mcp list`, `claw mcp show <name>` — these all return cleanly with the same `.claw.json` because they don't enter the runtime/Prompt path. They surface MCP servers at config-time only (per #102) without spawning them.
+     - Compare to `claw --output-format json doctor` — returns clean 7.9kB JSON in milliseconds because doctor doesn't spawn MCP either. The Prompt-only nature of the bug means it's invisible to most diagnostic commands.
+     - With the #127 fix landed (verb-suffix `--json` no longer falls through to Prompt), `claw doctor --json` no longer hits this MCP startup wedge — but ANY actual prompt invocation (`claw "..."`, `claw -p "..."`, `claw prompt "..."`, REPL `claw`, `--resume <id>` followed by chat) still does.
+
+     **Why this is specifically a clawability gap.**
+     1. *Auth-precondition ordering is inverted.* Cheap, deterministic precondition (cred env var present) should be checked before expensive, network-bound, externally-controlled precondition (MCP child handshake). The current order makes the MCP child a hard dependency for emitting any auth error.
+     2. *MCP startup wedges every Prompt invocation indefinitely.* A claw automating `claw "check repo"` against a misbehaved MCP server gets no exit code, no error stream, no completion event. The hang is invisible to subscribers because `terminal.output` only streams when the child writes; the runtime is just polling the MCP socket.
+     3. *Hides cred-missing errors entirely.* The README first-step guidance "export your API key, run `claw prompt 'hello'`" has a known cred-error fallback if the env var is missing. With MCP configured, that fallback never fires. Onboarding regression for any user who runs `claw init` (which auto-creates `.claw.json`) and then forgets the API key.
+     4. *Restart loop wastes resources.* Three `"Starting default (STDIO) server..."` lines in 30s = `claw` is restarting the npx child three times without surfacing the failure. Every restart costs the npx cold-start latency, the network fetch, and the MCP server's own init cost. Multiply by every claw rerun in a CI loop and the cost compounds.
+     5. *Runtime-side companion to #102's config-time gap.* #102 said doctor surfaces MCP at config-time only with no liveness probe — the Prompt path's *implicit* liveness probe is now the OPPOSITE problem: it blocks forever instead of timing out structurally.
+     6. *Joins truth-audit / diagnostic-integrity.* The hang is silent. No event saying "awaiting MCP handshake." No event saying "cred check skipped pending MCP init." The CLI lies by saying nothing.
+     7. *Joins PARITY.md Lane 7 regression risk.* PARITY.md claims "7. MCP lifecycle | merged | ... `+491/-24`" — the merge added the bridge, but the bridge has no startup-deadline contract, no cred-precheck ordering, no surface for "awaiting MCP handshake." Lane 7 acceptance is incomplete.
+     8. *Joins Phase 2 §4 Canonical lane event schema thesis.* A blocking, retried, silent MCP startup is exactly the un-machine-readable state the lane event schema was designed to eliminate.
+
+     **Fix shape (~150 lines across two files).**
+     1. *Move the credential-validation guard to BEFORE MCP server spawn in the Prompt dispatch path.* `rust/crates/rusty-claude-cli/src/main.rs` Prompt branch + `rust/crates/runtime/src/{provider_init.rs,mcp_tool_bridge.rs}`: detect missing creds in the verb-handler before constructing the runtime, emit the existing `missing Anthropic credentials` error, exit 1. ~30 lines.
+     2. *Add a startup-deadline contract to MCP child spawn.* `rust/crates/runtime/src/mcp_tool_bridge.rs`: 10s default deadline (configurable via `mcpServers.<name>.startupTimeoutMs`), if the `initialize` handshake doesn't complete in the deadline, kill the child, emit a typed `mcp.startup.timeout` event, surface a structured warning on Prompt setup. ~50 lines.
+     3. *Disable the silent restart loop.* `rust/crates/runtime/src/mcp_tool_bridge.rs`: if the spawn-and-handshake cycle fails twice for the same server, mark the server unavailable for the rest of the process, log to the structured warning surface, do NOT block subsequent Prompt invocations. ~20 lines.
+     4. *Surface MCP startup state in `status --json` and `doctor --json`.* Add `mcp_startup` summary block: per-server `{name, spawn_started_at_ms, handshake_completed_at_ms?, status: "pending"|"ready"|"timeout"|"failed"}`. ~20 lines.
+     5. *Lazy MCP spawn opt-in.* New config `mcpServers.<name>.lazy: true` (default false for parity) — spawn on first tool-call demand instead of at runtime init. Removes startup-cost regression for users who only sometimes use a given server. ~30 lines.
+     6. *Regression tests.*
+        - (a) `env -i PATH=$PATH HOME=$HOME claw "hello world"` with `mcpServers.everything` configured exits 1 with cred error in <500ms.
+        - (b) Same with auth set + bogus MCP — exits 1 with `mcp.startup.timeout` after the configured deadline.
+        - (c) `mcpServers.<name>.lazy: true` config makes `claw "hello"` skip the spawn until the LLM actually requests a tool.
+        - (d) `status --json` shows `mcp_startup` block with per-server state.
+        - (e) Three-server config (one bogus, one slow, one fast) doesn't block on the slow one once the fast one's handshake completes.
+     7. *Update PARITY.md Lane 7 to mark MCP lifecycle acceptance as `pending #129` until startup deadline + cred-precheck land.*
+
+     **Acceptance.** `env -i PATH=$PATH HOME=$HOME claw "hello"` with MCP configured + no auth exits 1 with cred error in <500ms (matching the no-MCP baseline). MCP startup respects a configurable deadline and surfaces typed timeout events. The npx-restart loop is gone. `status --json` and `doctor --json` show per-server MCP startup state.
+
+     **Blocker.** Some discussion needed on whether MCP-spawn-eagerness was an explicit product decision (warm tools at session start so the first tool call has zero latency) vs. an unintended consequence of the bridge wiring. If eager-spawn is intentional, the cred-precheck ordering fix alone is uncontroversial; the deadline + lazy-spawn become opt-ins. If eager-spawn was incidental, lazy-by-default is the better baseline.
+
+     **Source.** Jobdori dogfood 2026-04-20 against `/tmp/claw-mcp-test` (env-cleaned, working `mcpServers.everything = npx -y @modelcontextprotocol/server-everything`) on main HEAD `8122029` in response to Clawhip dogfood nudge / 10-min cron. Joins **MCP lifecycle gap family** as runtime-side companion to **#102** — #102 catches config-time silence (no preflight, no command-exists check); #129 catches runtime-side blocking (handshake await ordered before cred check, retried silently, no deadline). Joins **Truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107, #109, #110, #112, #114, #115, #125, #127) — the hang surfaces no events, no exit code, no signal. Joins **Auth-precondition / fail-fast ordering family** — cheap deterministic preconditions should run before expensive externally-controlled ones. Cross-cluster with **Recovery / wedge-recovery** — a misbehaved MCP server wedges every subsequent Prompt invocation; current recovery is "kill -9 the parent." Cross-cluster with **PARITY.md Lane 7 acceptance gap** — the Lane 7 merge added the bridge but didn't add startup-deadline + cred-precheck ordering, so the lane is technically merged but functionally incomplete for unattended claw use. Natural bundle: **#102 + #129** — MCP lifecycle visibility pair: config-time preflight (#102) + runtime-time deadline + cred-precheck (#129). Together they make MCP failures structurally legible from both ends. Also **#127 + #129** — Prompt-path silent-failure pair: verb-suffix args silently routed to Prompt (#127, fixed) + Prompt path silently blocks on MCP (#129). With #127 fixed, the `claw doctor --json` consumer no longer accidentally trips the #129 wedge — but the wedge still affects every legitimate Prompt invocation. Session tally: ROADMAP #129.
+
      **Repro (fresh box, no ANTHROPIC_* env vars).** `claw --model "bad model" version` → exit 0, emits version JSON (silent parse). `claw --model "" version` → exit 0, same. `claw --model "foo bar/baz" prompt "test"` → exit 1, `error: missing Anthropic credentials` (malformed model silently routes to Anthropic, then cred error masquerades as root cause instead of "invalid model syntax").
 
      **The gap.** (1) No upfront model syntax validation in parse_args. `--model` accepts any string. (2) Silent fallback to Anthropic when provider detection fails on malformed syntax. (3) Downstream error misdirection — cred error doesn't say "your model string was invalid, I fell back to Anthropic." (4) Token burn on invalid model at API layer — with credentials set, malformed model reaches the API, billing tokens against a 400 response that should have been rejected client-side. (5) Joins #29 (provider routing silent fallback) — both involve Anthropic fallback masking the real intent. (6) Joins truth-audit — status/version JSON report malformed model without validation. (7) Joins cred-error misdirection family (#28, #99, #127).
