@@ -5015,6 +5015,27 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
    **Source.** Jobdori dogfood 2026-04-20 against `/tmp/jobdori-129-mcp-cred-order` + `/tmp/stale-branch` in response to 10-min cron cycle. Confirmed: `claw doctor` on branch 5 commits behind main says "Status: ok" but `prompt` dispatch would warn "worktree HEAD does not match expected base commit." Gap is a missing invocation of the already-correct `run_stale_base_preflight()` in the `doctor` action handler. Joins **Boot preflight / doctor contract (#80–#83, #114)** family — doctor is the single machine-readable preflight surface; missing checks degrade operator trust. Also relates to **Silent-state inventory** cluster (#102/#127/#129/#245) because stale-base is a runtime truth ("my branch is behind main") that the preflight surface (doctor) does not expose.
 
+## Pinpoint #135. `claw status --json` missing `active_session` boolean and `session.id` cross-reference — two surfaces that should be unified are inconsistent
+
+**Gap.** `claw status --json` exposes a snapshot of the runtime state but does not include (1) a stable `session.id` field (filed as #134 — the fix from the other side is to emit it in lane events; the consumer side needs it queryable via `status` too) and (2) an `active_session: bool` that tells an orchestrator whether the runtime currently has a live session in flight. An external orchestrator (Clawhip, remote agent) running `claw status --json` after sending a prompt has no machine-readable way to confirm whether the session is alive, idle, or stalled without parsing log output.
+
+**Trace path.**
+- `claw status --json` (dispatcher in `main.rs` `CliAction::Status`) renders a `StatusReport` struct that includes `git_state`, `config`, `model`, `provider` — but no `session_id` or `active_session` fields.
+- `claw status` (text mode) also omits both.
+- The `session.id` fix from #134 introduces a UUID at session init; it should be threaded through to `StatusReport` so the round-trip is complete: emit on startup event → queryable via `status --json` → correlatable in lane events.
+
+**Fix shape (~30 lines).**
+1. Add `session_id: Option<String>` and `active_session: bool` to `StatusReport` struct. Both `null`/`false` when no session is active. When a session is running, `session_id` is the same UUID emitted in the startup lane event (#134).
+2. Thread the session state into the `status` handler via a shared `Arc<Mutex<SessionState>>` or equivalent (same mechanism #134 uses for startup event emission).
+3. Text-mode `claw status` surfaces the value: `Session: active (id: abc123)` or `Session: idle`.
+4. Regression tests: (a) `claw status --json` before any prompt → `active_session: false, session_id: null`. (b) `claw status --json` during a prompt session → `active_session: true, session_id: <uuid>`. (c) UUID matches the `session.id` in the first lane event of the same run.
+
+**Acceptance.** An orchestrator can poll `claw status --json` and determine: is there a live session? What is its correlation ID? Does it match the ID from the last startup event? This closes the round-trip opened by #134.
+
+**Blocker.** Depends on #134 (session.id generation at init). Can be filed and implemented together.
+
+**Source.** Jobdori dogfood 2026-04-21 06:53 KST on main HEAD `2c42f8b` during recurring cron cycle. Direct sibling of #134 — #134 covers the event-emission side, #135 covers the query side. Joins **Session identity completeness** (§4.7) and **status surface completeness** cluster (#80/#83/#114/#122). Natural bundle: **#134 + #135** closes the full session-identity round-trip. Session tally: ROADMAP #135.
+
 ## Pinpoint #134. No run/correlation ID at session boundary — every observer must infer session identity from timing or prompt content
 
    **Gap.** When a `claw` session starts, no stable correlation ID is emitted in the first structured event (or any event). Every observer — lane event consumer, log aggregator, Clawhip router, test harness — has to infer session identity from timing proximity or prompt content. If two sessions start in close succession there is no unambiguous way to attribute subsequent events to the correct session. `claw status --json` returns session metadata but does not expose an opaque stable ID that could be used as a correlation key across the event stream.
