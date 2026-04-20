@@ -711,6 +711,39 @@ Acceptance:
 - token-risk preflight becomes operational guidance, not just warning text
 - first-run users stop getting stuck between diagnosis and manual cleanup
 
+### 4.44. Typed-error envelope contract (Silent-state inventory roll-up)
+Claw-code currently flattens every error class — filesystem, auth, session, parse, runtime, MCP, usage — into the same lossy `{type:"error", error:"<prose>"}` envelope. Both human operators and downstream claws lose the ability to programmatically tell what operation failed, which path/resource failed, what kind of failure it was, and whether the failure is retryable, actionable, or terminal. This roll-up locks in the typed-error contract that closes the family of pinpoints currently scattered across **#102 + #129** (MCP readiness opacity), **#127 + #245** (delivery surface opacity), and **#121 + #130** (error-text-lies / errno-strips-context).
+
+Required behavior:
+- structured `error.kind` enum: at minimum `filesystem | auth | session | parse | runtime | mcp | delivery | usage | policy | unknown` (extensible)
+- `error.operation` field naming the syscall/method that failed (e.g. `"write"`, `"open"`, `"resolve_session"`, `"mcp.initialize_handshake"`, `"deliver_prompt"`)
+- `error.target` field naming the resource that failed (path for fs errors, session-id for session errors, server-name for MCP errors, channel-id for delivery errors)
+- `error.errno` / `error.detail` field for the platform-specific underlying detail (kept as nested diagnostic data, not as the entire user-facing surface)
+- `error.hint` field for the actionable next step (`"intermediate directory does not exist; try mkdir -p"`, `"export ANTHROPIC_AUTH_TOKEN"`, `"this session id was already cleared via /clear; try /session list"`)
+- `error.retryable` boolean signaling whether downstream automation can safely retry without operator intervention
+- text-mode rendering preserves all five fields in operator-readable prose; JSON-mode rendering exposes them as structured subfields
+- `Run claw --help for usage` trailer is gated on `error.kind == usage` only — not appended to filesystem, auth, session, MCP, or runtime errors where it misdirects the operator
+- backward-compat: top-level `{error: "<prose>", type: "error"}` shape retained so existing claws that string-parse the envelope continue to work; new fields are additive
+- regression locked via golden-fixture tests — every (verb, error-kind) cell in the matrix has a fixture file that captures the exact envelope shape
+- the `kind` enum is registered alongside the schema registry (Phase 2 §2) so downstream consumers can negotiate the version they understand
+
+Acceptance:
+- a claw consuming `--output-format json` can switch on `error.kind` to dispatch retry vs escalate vs terminate without regex-scraping the prose
+- `claw export --output /tmp/nonexistent/dir/out.md` returns `{error:{kind:"filesystem",operation:"write",target:"/tmp/nonexistent/dir/out.md",errno:"ENOENT",hint:"intermediate directory does not exist; try mkdir -p /tmp/nonexistent/dir first",retryable:true},type:"error"}` instead of `{error:"No such file or directory (os error 2)",type:"error"}`
+- `claw "prompt"` with missing creds returns `{error:{kind:"auth",operation:"resolve_anthropic_auth",target:"ANTHROPIC_AUTH_TOKEN",hint:"export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY",retryable:false},type:"error"}` instead of the current bare prose
+- `claw --resume does-not-exist /status` returns `{error:{kind:"session",operation:"resolve_session_id",target:"does-not-exist",hint:"managed sessions live in .claw/sessions/; try latest or /session list",retryable:false},type:"error"}`
+- the cluster pinpoints (#102, #121, #127, #129, #130, #245) all collapse into individual fix work that conforms to this envelope contract
+- `Run claw --help for usage` trailer disappears from the 80%+ of error paths where it currently misleads
+- monitoring/observability tools can build typed dashboards (`group by error.kind`, `count where error.kind="mcp" AND error.operation="initialize_handshake"`) without regex churn
+
+Why this is the natural roll-up:
+- six pinpoints (#102, #121, #127, #129, #130, #245) are all the same root disease: important failure states are not emitted as typed, structured, operator-usable outcomes
+- fixing each pinpoint individually risks producing six different ad-hoc envelope shapes; locking in the contract first guarantees they converge
+- this contract is exhibit A for Phase 2 §4 Canonical lane event schema — typed errors are the prerequisite for typed lane events
+- aligns with Product Principle #5 (Partial success is first-class) by making partial-failure states machine-readable
+
+**Source.** Drafted 2026-04-20 jointly with gaebal-gajae during clawcode-dogfood cycle (`#clawcode-building-in-public` channel) after #130 filing surfaced the same envelope-flattening pattern as gaebal-gajae's #245 control-plane delivery opacity. Cluster bundle: **#102 + #121 + #127 + #129 + #130 + #245** — all six pinpoints contribute evidence; this §4.44 entry locks in the contract that fix-work for each pinpoint must conform to. Sibling to **§5 Failure taxonomy** below — §5 lists the failure CLASS names; §4.44 specifies the envelope SHAPE that carries the class plus operation, target, hint, errno, and retryable signal.
+
 ### 5. Failure taxonomy
 Normalize failure classes:
 - `prompt_delivery`
