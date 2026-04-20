@@ -803,7 +803,12 @@ Acceptance:
 - channel status updates stay short and machine-grounded
 - claws stop inferring state from raw build spam
 
-### 6.5. Blocked-state subphase contract
+### 133. Blocked-state subphase contract (was §6.5)
+**Filed:** 2026-04-20 from dogfood cycle — previous cycle identified §4.44.5 provenance gap, this cycle targets §6.5 implementation.
+
+**Problem:** Currently `lane.blocked` is a single opaque state. Recovery recipes cannot distinguish trust-gate blockers from MCP handshake failures, branch freshness issues, or test hangs. All blocked lanes look the same, forcing pane-scrape triage.
+
+**Concrete implementation:
 When a lane is `blocked`, also expose the exact subphase where progress stopped, rather than forcing claws to infer from logs.
 
 Subphases should include at least:

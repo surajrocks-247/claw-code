@@ -384,10 +384,30 @@ pub fn dedupe_terminal_events(events: &[LaneEvent]) -> Vec<LaneEvent> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockedSubphase {
+    #[serde(rename = "blocked.trust_prompt")]
+    TrustPrompt { gate_repo: String },
+    #[serde(rename = "blocked.prompt_delivery")]
+    PromptDelivery { attempt: u32 },
+    #[serde(rename = "blocked.plugin_init")]
+    PluginInit { plugin_name: String },
+    #[serde(rename = "blocked.mcp_handshake")]
+    McpHandshake { server_name: String, attempt: u32 },
+    #[serde(rename = "blocked.branch_freshness")]
+    BranchFreshness { behind_main: u32 },
+    #[serde(rename = "blocked.test_hang")]
+    TestHang { elapsed_secs: u32, test_name: Option<String> },
+    #[serde(rename = "blocked.report_pending")]
+    ReportPending { since_secs: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneEventBlocker {
     #[serde(rename = "failureClass")]
     pub failure_class: LaneFailureClass,
     pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subphase: Option<BlockedSubphase>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,16 +507,24 @@ impl LaneEvent {
 
     #[must_use]
     pub fn blocked(emitted_at: impl Into<String>, blocker: &LaneEventBlocker) -> Self {
-        Self::new(LaneEventName::Blocked, LaneEventStatus::Blocked, emitted_at)
+        let mut event = Self::new(LaneEventName::Blocked, LaneEventStatus::Blocked, emitted_at)
             .with_failure_class(blocker.failure_class)
-            .with_detail(blocker.detail.clone())
+            .with_detail(blocker.detail.clone());
+        if let Some(ref subphase) = blocker.subphase {
+            event = event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
+        }
+        event
     }
 
     #[must_use]
     pub fn failed(emitted_at: impl Into<String>, blocker: &LaneEventBlocker) -> Self {
-        Self::new(LaneEventName::Failed, LaneEventStatus::Failed, emitted_at)
+        let mut event = Self::new(LaneEventName::Failed, LaneEventStatus::Failed, emitted_at)
             .with_failure_class(blocker.failure_class)
-            .with_detail(blocker.detail.clone())
+            .with_detail(blocker.detail.clone());
+        if let Some(ref subphase) = blocker.subphase {
+            event = event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
+        }
+        event
     }
 
     #[must_use]
@@ -570,9 +598,9 @@ mod tests {
 
     use super::{
         compute_event_fingerprint, dedupe_superseded_commit_events, dedupe_terminal_events,
-        is_terminal_event, EventProvenance, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
-        LaneEventBuilder, LaneEventMetadata, LaneEventName, LaneEventStatus, LaneFailureClass,
-        LaneOwnership, SessionIdentity, WatcherAction,
+        is_terminal_event, BlockedSubphase, EventProvenance, LaneCommitProvenance, LaneEvent,
+        LaneEventBlocker, LaneEventBuilder, LaneEventMetadata, LaneEventName, LaneEventStatus,
+        LaneFailureClass, LaneOwnership, SessionIdentity, WatcherAction,
     };
 
     #[test]
@@ -641,6 +669,10 @@ mod tests {
         let blocker = LaneEventBlocker {
             failure_class: LaneFailureClass::McpStartup,
             detail: "broken server".to_string(),
+            subphase: Some(BlockedSubphase::McpHandshake {
+                server_name: "test-server".to_string(),
+                attempt: 1,
+            }),
         };
 
         let blocked = LaneEvent::blocked("2026-04-04T00:00:00Z", &blocker);
