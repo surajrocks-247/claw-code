@@ -711,6 +711,22 @@ Acceptance:
 - token-risk preflight becomes operational guidance, not just warning text
 - first-run users stop getting stuck between diagnosis and manual cleanup
 
+### 4.44.5. Ship/provenance opacity — branch → merge → main-push boundary not first-class
+
+When dogfood work lands on `main`, the delivery path (scoped branch → PR → merge → push vs direct push) and the exact commit set shipped are not surfaced as first-class events. This makes it too easy to lose the boundary between "dogfood fix landed", "what exact commits shipped", and "what review/merge path was actually used." The 56-commit push during 2026-04-20 dogfood (#122/#127/#129/#130/#131/#132) exhibited this gap: work started as scoped pinpoint branches, then collapsed into a direct `origin/main` push with no structured provenance trail.
+
+Required behavior:
+- emit `ship.provenance` event with: source branch, merge method (PR #, direct push, fast-forward), commit range (first..last), and actor
+- distinguish `intentional.ship` (explicit deliverables like #122-#132) from `incidental.rider` (other commits in the push)
+- surface in lane events and `claw state` output
+- clawhip can report "6 pinpoints shipped, 50 riders, via direct push" without git archaeology
+
+Acceptance:
+- no post-hoc human reconstruction needed to answer "what just shipped and by what path"
+- delivery path is machine-readable and auditable
+
+Source: gaebal-gajae dogfood observation 2026-04-20 — the very run that exposed the gap.
+
 ### 4.44. Typed-error envelope contract (Silent-state inventory roll-up)
 Claw-code currently flattens every error class — filesystem, auth, session, parse, runtime, MCP, usage — into the same lossy `{type:"error", error:"<prose>"}` envelope. Both human operators and downstream claws lose the ability to programmatically tell what operation failed, which path/resource failed, what kind of failure it was, and whether the failure is retryable, actionable, or terminal. This roll-up locks in the typed-error contract that closes the family of pinpoints currently scattered across **#102 + #129** (MCP readiness opacity), **#127 + #245** (delivery surface opacity), and **#121 + #130** (error-text-lies / errno-strips-context).
 
