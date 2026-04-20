@@ -4939,3 +4939,30 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** None. Validation fn ~20 lines, parse-time check ~5 lines, tests ~10 lines.
 
      **Source.** Jobdori dogfood 2026-04-20 on main HEAD `d284ef7` in the 10-minute claw-code cycle in response to Clawhip nudge for orthogonal pinpoints. Joins **Parser-level trust gap family** (#108, #117, #119, #122, #127, **#128**) as 6th — different parser surface (model flag validation) but same pattern: silent acceptance of malformed input that should have been rejected at parse time. Joins **Cred-error misdirection** (#28, #99, #127) — malformed model silently routes to Anthropic, then cred error misdirects from the real cause (syntax). Joins **Truth-audit / diagnostic-integrity** — status/version JSON report the malformed model string without validation. Joins **Token burn / unwanted API calls** (#99, #127 via prompt dispatch, **#128** via invalid model at API layer) — malformed input reaches the API instead of being rejected client-side. Natural sibling of #127 (both involve silent acceptance at parse time, both route to cred-error as the surface symptom). Session tally: ROADMAP #128.
+
+## Pinpoint #122. `doctor` invocation does not check stale-base condition; `run_stale_base_preflight()` is only invoked in Prompt + REPL paths
+
+**The clawability gap.** The claw runtime has a `stale_base.rs` module that correctly detects when `worktree HEAD does not match expected base commit`, formats a warning, and prints it to stderr during `Prompt` and `REPL` dispatch. However, `doctor` does NOT invoke the stale-base check. A worker can run `claw doctor` in a stale branch and receive `Status: ok` (green lights across all checks) while the actual prompt execution would warn about staleness. The two surfaces are inconsistent: `doctor` says "safe to proceed" but `prompt` will warn "you may be running against stale code."
+
+   **Trace path.**
+   - `rust/crates/rusty-claude-cli/src/main.rs:4845-4855` — `run_doctor(output_format)` → `render_doctor_report()` produces the doctor DiagnosticResult + renders it. No stale-base preflight invoked.
+   - `rust/crates/rusty-claude-cli/src/main.rs:3680` (`CliAction::Prompt` handler, line 3688) and `3799` (REPL handler, line 3810) — both call `run_stale_base_preflight(base_commit.as_deref())` BEFORE constructing LiveCli.
+   - `rust/crates/runtime/src/stale_base.rs` — the module defines `check_base_commit()` + `format_stale_base_warning()`, which are correct. The problem is not the check, it's the invocation site: `doctor` is missing it.
+
+   **Why this matters.** `doctor` is the single machine-readable preflight surface that determines whether a worker should proceed. If `doctor` says OK but `prompt` says "stale base," that inconsistency is a trust boundary violation (Section 3.5: Boot preflight / doctor contract). A worker orchestrator (clayhip, remote agent) relies on `doctor status` to decide whether to send the actual prompt. If the preflight omits the stale-base check, the orchestrator has incomplete information and may make incorrect routing/retry decisions.
+
+   **Fix shape — one piece.**
+   1. *Add stale-base check to `doctor` output.* In `render_doctor_report()`, collect the same `stale_base::BaseCommitState` that `run_stale_base_preflight()` computes (by calling `check_base_commit(&cwd, resolve_expected_base(None, &cwd).as_ref())` — note: `doctor` never receives `--base-commit` flag value, so expected base comes from `.claw-base` file only). Convert the `BaseCommitState` into a doctor `DiagnosticCheck` (parallel to existing `auth`, `config`, `git_state`, etc.). If `Diverged`, emit `DiagnosticLevel::Warn` with expected and actual commit hashes. If `NotAGitRepo` or `NoExpectedBase`, emit `DiagnosticLevel::Ok`. ~20 lines.
+   2. *Surface base_commit source in `status --json` output.* Alongside the existing JSON fields, add `base_commit_expected: <value> | null` and `base_commit_actual: <hash>`. If no `.claw-base` file exists, `base_commit_expected: null`. If diverged, `status` JSON includes both fields so downstream claws can see the mismatch in machine-readable form. ~15 lines.
+   3. *Regression tests.*
+      - (a) `claw doctor` in a git worktree with no `.claw-base` file emits DiagnosticLevel::Ok for base commit (no expected value, so no check).
+      - (b) `claw doctor` in a git worktree where `.claw-base` matches HEAD emits DiagnosticLevel::Ok.
+      - (c) `claw doctor` in a git worktree where `.claw-base` is 5 commits behind HEAD emits DiagnosticLevel::Warn with the two hashes.
+      - (d) `claw doctor` outside a git repo emits DiagnosticLevel::Ok ("git check skipped — not inside a repository").
+      - (e) `claw status --json` includes `base_commit_expected` and `base_commit_actual` fields in output.
+
+   **Acceptance.** `claw doctor` surface is complete: the same stale-base check that `prompt` uses is visible to preflight consumers. If a worker has a stale base, `doctor` warns about it instead of silently passing. `doctor` JSON output exposes base_commit state so downstream orchestrators can query it.
+
+   **Blocker.** None. Reuses existing `stale_base` module; no new logic needed, just a missing call site.
+
+   **Source.** Jobdori dogfood 2026-04-20 against `/tmp/jobdori-129-mcp-cred-order` + `/tmp/stale-branch` in response to 10-min cron cycle. Confirmed: `claw doctor` on branch 5 commits behind main says "Status: ok" but `prompt` dispatch would warn "worktree HEAD does not match expected base commit." Gap is a missing invocation of the already-correct `run_stale_base_preflight()` in the `doctor` action handler. Joins **Boot preflight / doctor contract (#80–#83, #114)** family — doctor is the single machine-readable preflight surface; missing checks degrade operator trust. Also relates to **Silent-state inventory** cluster (#102/#127/#129/#245) because stale-base is a runtime truth ("my branch is behind main") that the preflight surface (doctor) does not expose.
