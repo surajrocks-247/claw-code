@@ -741,6 +741,19 @@ Acceptance:
 
 Source: gaebal-gajae dogfood observation 2026-04-20 — the very run that exposed the gap.
 
+**Incomplete gap identified 2026-04-20:**
+Schema and event constructors implemented in `lane_events.rs::ShipProvenance` and `LaneEvent::ship_*()` methods. **Missing: wiring.** Git push operations in rusty-claude-cli do not yet emit these events. When `git push origin main` executes, no `ship.prepared/commits_selected/merged/pushed_main` events are emitted to observability layer. Events remain dead code (tests-only).
+
+**Next pinpoint (§4.44.5.1):** Ship event wiring
+Wire `LaneEvent::ship_*()` emission into actual git push call sites:
+1. Locate `git push origin <branch>` command execution(s) in `main.rs`, `tools/lib.rs`, or `worker_boot.rs`
+2. Intercept before/after push: emit `ship.prepared` (before merge), `ship.commits_selected` (lock range), `ship.merged` (after merge), `ship.pushed_main` (after push to origin/main)
+3. Capture real metadata: `source_branch`, `commit_range`, `merge_method`, `actor`, `pr_number`
+4. Route events to lane event stream
+5. Verify `claw state` output surfaces ship provenance
+
+Acceptance: git push emits all 4 events with real metadata, `claw state` JSON includes `ship` provenance.
+
 ### 4.44. Typed-error envelope contract (Silent-state inventory roll-up)
 Claw-code currently flattens every error class — filesystem, auth, session, parse, runtime, MCP, usage — into the same lossy `{type:"error", error:"<prose>"}` envelope. Both human operators and downstream claws lose the ability to programmatically tell what operation failed, which path/resource failed, what kind of failure it was, and whether the failure is retryable, actionable, or terminal. This roll-up locks in the typed-error contract that closes the family of pinpoints currently scattered across **#102 + #129** (MCP readiness opacity), **#127 + #245** (delivery surface opacity), and **#121 + #130** (error-text-lies / errno-strips-context).
 
