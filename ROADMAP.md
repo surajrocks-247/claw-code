@@ -5885,3 +5885,23 @@ pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
 **Blocker.** None.
 
 **Source.** Q's ack on #150 surfaced the deeper gap: "#150 closed is real value" but the product function still has the brittleness. Session tally: ROADMAP #151.
+
+## Pinpoint #152. Diagnostic verb suffixes allow arbitrary positional args, emit double "error:" prefix
+
+**Gap.** Verbs like `claw doctor garbage` and `claw status foo bar` parse successfully instead of failing at parse time. The positional arguments fall through to the prompt-execution path, or in some cases the verb parser doesn't have a flag-only guard. Additionally, the error formatter doubles the "error:" prefix and doesn't hint at `--output-format json` for verbs that don't recognize `--json` as an alias.
+
+**Example failures:**
+- `claw doctor garbage` → silently treats "garbage" as a prompt instead of rejecting "doctor" as a verb with unexpected args
+- `claw system-prompt --json` → errors with "error: unknown option" but doesn't suggest `--output-format json`
+- Error messages show `error: error: <message>` (double prefix)
+
+**Fix shape (~30 lines).** Three improvements:
+1. Wire parse_verb_suffix to reject positional args after verbs (except multi-word prompts like "help me debug")
+2. Special-case `--json` in the verb-option error path to suggest `--output-format json`
+3. Remove the "error:" prefix from format_unknown_verb_option (already added by top-level handler)
+
+**Acceptance:** `claw doctor garbage` exits 1 with "unexpected positional argument"; `claw system-prompt --json` hints at `--output-format json`; error messages have single "error:" prefix.
+
+**Blocker.** None. Implementation exists on worktree `jobdori-127-verb-suffix` but needs rebase against main (conflicts with #141 which already shipped).
+
+**Source.** Clawhip nudge 2026-04-21 21:17 KST — "no excuses, always find something to ship" directive. Session tally: ROADMAP #152.
