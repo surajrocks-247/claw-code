@@ -5369,3 +5369,89 @@ On idempotent call: `created: []`, `skipped: [".claw", ".claw.json", ...]`.
 **Blocker.** None. Scoped to `init` subcommand JSON serializer. ~40 lines.
 
 **Source.** Jobdori dogfood 2026-04-21 17:34 KST on main HEAD `21b377d`. Joins **JSON output completeness** cluster (#90/#91/#92/#127/#130/#136). Session tally: ROADMAP #142.
+
+## Pinpoint #143. `claw status` hard-fails on malformed MCP config; `claw doctor` degrades gracefully — inconsistent contract around partial config breakage
+
+**Gap.** Running `claw status` against a workspace with a malformed `.claw.json` (e.g., one `mcpServers.*` entry missing the required `command` field) crashes out at parse time with a terse error, even when the rest of the config is valid and most status fields could still be reported. `claw doctor` handles the exact same file correctly, embedding the parse error inside the typed envelope as `status: "fail"` on the `config` check while still reporting `auth`, `install source`, `workspace`, etc.
+
+This is both an inconsistency (two diagnostic surfaces behave differently on identical input) and a violation of Product Principle #5 (*Partial success is first-class*).
+
+**Verified on main HEAD `e73b6a2` (2026-04-21 18:30 KST):**
+
+Given a `.claw.json` with one valid server and one malformed entry:
+```json
+{
+  "mcpServers": {
+    "everything": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"] },
+    "missing-command": { "args": ["arg-only-no-command"] }
+  }
+}
+```
+
+`claw status` (both text and JSON modes):
+```
+$ claw status
+error: /Users/.../.claw.json: mcpServers.missing-command: missing string field command
+Run `claw --help` for usage.
+
+$ claw status --output-format json
+{"error":"/Users/.../.claw.json: mcpServers.missing-command: missing string field command","type":"error"}
+```
+
+`claw doctor --output-format json` on the *same* file:
+```json
+{
+  "checks": [
+    {"name":"auth", "status":"warn", ...},
+    {
+      "name":"config",
+      "status":"fail",
+      "load_error":"/Users/.../.claw.json: mcpServers.missing-command: missing string field command",
+      "discovered_files":["..."],
+      "discovered_files_count":5,
+      "summary":"runtime config failed to load: ..."
+    },
+    {"name":"install_source", "status":"ok", ...},
+    ...
+  ]
+}
+```
+
+Doctor keeps going and produces a full typed report. Status refuses to produce any fields at all.
+
+**Why this is a clawability gap.**
+1. **Two surfaces, one config, two behaviors.** A claw cannot rely on a stable contract: `doctor` treats malformed MCP as a classifiable condition; `status` treats it as a fatal parse error. Same input, opposite response.
+2. **Partial-success violation (Principle #5).** The malformed field is scoped to one MCP server entry. Workspace state, current model, permission mode, session info, and git state are all independently resolvable and would be useful to report even when one MCP server entry is unparseable. A claw debugging a misconfig needs to see which fields *do* work.
+3. **No per-field error surface.** Even the bare error string lacks structure (`mcpServers.missing-command: missing string field command` is a parse trace, not a typed error object). No `error_kind`, no `retryable`, no `affected_field`, no `hint`. Claws can't route on this.
+4. **Clawhip health checks.** Clawhip uses `claw status --output-format json` as a liveness probe on managed lanes. A single broken MCP entry takes down the probe entirely, not just the MCP subsystem, making "is the workspace usable?" impossible to answer without also running `doctor`.
+5. **Onboarding friction.** A user who copy-pastes an MCP config and mistypes one field discovers this only when `status` stops working. Doctor tells them what's wrong; status does not. First-run users are more likely to reach for `status`.
+
+**Fix shape (~60-100 lines, two-phase).**
+
+**Phase 1 (immediate, small):** Make `claw status` degrade gracefully like `doctor` does. When config load fails:
+- Report `config_load_error` as a first-class field with the parse-error string.
+- Still report what can be resolved without config: effective model (from env + CLI args), permission mode, sandbox posture, git state, workspace metadata.
+- Set top-level `status: "degraded"` in the envelope so claws can distinguish "status ran but config is broken" from "status ran cleanly".
+- Keep the existing error text as a `config_load_error` string for humans, but do not abort.
+
+**Phase 2 (medium, joins typed-error taxonomy #4.44):** Typed error object for config-parse failures:
+```json
+"config_load_error": {
+  "kind": "config_parse",
+  "retryable": false,
+  "file": "/Users/.../.claw.json",
+  "field_path": "mcpServers.missing-command",
+  "message": "missing string field command",
+  "hint": "each mcpServers entry requires a `command` string; see USAGE.md#mcp"
+}
+```
+
+**Acceptance.**
+- `claw status` on a workspace with one malformed MCP entry returns exit code 0 with a top-level `status: "degraded"` (or equivalent typed marker) and populated workspace/git/model/permission fields.
+- The malformed MCP error surfaces as a structured `config_load_error` field, not as a bare string at the envelope root.
+- `claw status --output-format json` contract matches `claw doctor --output-format json` on the same input: both must report the config parse error, neither may hard-fail.
+- Regression test: inject malformed MCP config, assert `status` returns 0 with degraded marker and `config_load_error.field_path == "mcpServers.missing-command"`.
+
+**Blocker.** None for Phase 1. Phase 2 depends on the typed-error taxonomy landing (ROADMAP §4.44), but Phase 1 can ship independently and be tightened later.
+
+**Source.** Jobdori dogfood 2026-04-21 18:30 KST on main HEAD `e73b6a2`, surfaced by running `claw status` in `/Users/yeongyu/clawd` which contains a `.claw.json` with deliberately broken MCP entries. Joins **partial-success / degraded-mode** cluster (Principle #5, Phase 6) and **surface consistency** cluster (#141 help-contract unification, #108 typo guard). Session tally: ROADMAP #143.
