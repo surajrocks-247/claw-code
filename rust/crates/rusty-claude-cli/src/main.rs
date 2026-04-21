@@ -2948,11 +2948,15 @@ fn run_resume_command(
             json: Some(render_memory_json()?),
         }),
         SlashCommand::Init => {
-            let message = init_claude_md()?;
+            // #142: run the init once, then render both text + structured JSON
+            // from the same InitReport so both surfaces stay in sync.
+            let cwd = env::current_dir()?;
+            let report = crate::init::initialize_repo(&cwd)?;
+            let message = report.render();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(message.clone()),
-                json: Some(init_json_value(&message)),
+                json: Some(init_json_value(&report, &message)),
             })
         }
         SlashCommand::Diff => {
@@ -5666,20 +5670,31 @@ fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn run_init(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let message = init_claude_md()?;
+    let cwd = env::current_dir()?;
+    let report = initialize_repo(&cwd)?;
+    let message = report.render();
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
         CliOutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&init_json_value(&message))?
+            serde_json::to_string_pretty(&init_json_value(&report, &message))?
         ),
     }
     Ok(())
 }
 
-fn init_json_value(message: &str) -> serde_json::Value {
+/// #142: emit first-class structured fields alongside the legacy `message`
+/// string so claws can detect per-artifact state without substring matching.
+fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_json::Value {
+    use crate::init::InitStatus;
     json!({
         "kind": "init",
+        "project_path": report.project_root.display().to_string(),
+        "created": report.artifacts_with_status(InitStatus::Created),
+        "updated": report.artifacts_with_status(InitStatus::Updated),
+        "skipped": report.artifacts_with_status(InitStatus::Skipped),
+        "artifacts": report.artifact_json_entries(),
+        "next_step": crate::init::InitReport::NEXT_STEP,
         "message": message,
     })
 }
