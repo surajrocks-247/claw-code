@@ -830,6 +830,25 @@ Acceptance:
 - channel status updates stay short and machine-grounded
 - claws stop inferring state from raw build spam
 
+### 137. Model-alias shorthand regression in test suite — bare alias parsing broken on `feat/134-135-session-identity` branch
+
+**Filed:** 2026-04-21 from dogfood cycle — `cargo test --workspace` on `feat/134-135-session-identity` HEAD (`91ba54d`) shows 3 failing tests.
+
+**Problem:** `tests::parses_bare_prompt_and_json_output_flag`, `tests::multi_word_prompt_still_uses_shorthand_prompt_mode`, and `tests::env_permission_mode_overrides_project_config_default` all panic with:
+```
+args should parse: "invalid model syntax: 'claude-opus'. Expected provider/model (e.g., anthropic/claude-opus-4-6) or known alias (opus, sonnet, haiku)"
+```
+The #134/#135 session-identity work tightened model-syntax validation but the test fixtures still pass bare `claude-opus` style strings that the new validator rejects. 162 tests pass; only the three tests using legacy bare-alias model names fail.
+
+**Fix shape:**
+- Update the three failing test fixtures to use either a valid alias (`opus`, `sonnet`, `haiku`) or a fully-qualified model id (`anthropic/claude-opus-4-6`)
+- Alternatively, if `claude-opus` is an intended supported alias, add it to the alias registry
+- Verify `cargo test --workspace` returns 0 failures before merging the feat branch to `main`
+
+**Acceptance:**
+- `cargo test --workspace` passes with 0 failures on the `feat/134-135-session-identity` branch
+- No regression on the 162 tests currently passing
+
 ### 133. Blocked-state subphase contract (was §6.5)
 **Filed:** 2026-04-20 from dogfood cycle — previous cycle identified §4.44.5 provenance gap, this cycle targets §6.5 implementation.
 
