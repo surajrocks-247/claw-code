@@ -1690,14 +1690,21 @@ fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::e
     let cwd = env::current_dir()?;
     let state_path = cwd.join(".claw").join("worker-state.json");
     if !state_path.exists() {
-        // Emit a structured error, then return Err so the process exits 1.
-        // Callers (scripts, CI) need a non-zero exit to detect "no state" without
-        // parsing prose output.
-        // Let the error propagate to main() which will format it correctly
-        // (prose for text mode, JSON envelope for --output-format json).
+        // #139: this error used to say "run a worker first" without telling
+        // callers how to run one. "worker" is an internal concept (there is
+        // no `claw worker` subcommand), so claws/CI had no discoverable path
+        // from the error to a fix. Emit an actionable, structured error that
+        // names the two concrete commands that produce worker state.
+        //
+        // Format in both text and JSON modes is stable so scripts can match:
+        //   error: no worker state file found at <path>
+        //     Hint: worker state is written by the interactive REPL or a non-interactive prompt.
+        //     Run:   claw               # start the REPL (writes state on first turn)
+        //     Or:    claw prompt <text> # run one non-interactive turn
+        //     Then rerun: claw state [--output-format json]
         return Err(format!(
-            "no worker state file found at {} — run a worker first",
-            state_path.display()
+            "no worker state file found at {path}\n  Hint: worker state is written by the interactive REPL or a non-interactive prompt.\n  Run:   claw               # start the REPL (writes state on first turn)\n  Or:    claw prompt <text> # run one non-interactive turn\n  Then rerun: claw state [--output-format json]",
+            path = state_path.display()
         )
         .into());
     }
@@ -5400,11 +5407,13 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
             .to_string(),
         LocalHelpTopic::State => "State
   Usage            claw state [--output-format <format>]
-  Purpose          read the worker state file written by the interactive REPL
+  Purpose          read .claw/worker-state.json written by the interactive REPL or a one-shot prompt
   Output           worker id, model, permissions, session reference (text or json)
   Formats          text (default), json
-  Prerequisite     run `claw` interactively or `claw prompt <text>` to produce worker state first
-  Related          ROADMAP #139 (worker-concept discoverability) · claw status"
+  Produces state   `claw` (interactive REPL) or `claw prompt <text>` (one non-interactive turn)
+  Observes state   `claw state` reads; clawhip/CI may poll this file without HTTP
+  Exit codes       0 if state file exists and parses; 1 with actionable hint otherwise
+  Related          claw status · ROADMAP #139 (this worker-concept contract)"
             .to_string(),
         LocalHelpTopic::Export => "Export
   Usage            claw export [--session <id|latest>] [--output <path>] [--output-format <format>]
@@ -9612,6 +9621,52 @@ mod tests {
                 "{subcommand} help text should contain a Usage line"
             );
         }
+    }
+
+    #[test]
+    fn state_error_surfaces_actionable_worker_commands_139() {
+        // #139: the error for missing `.claw/worker-state.json` must name
+        // the concrete commands that produce worker state, otherwise claws
+        // have no discoverable path from the error to a fix.
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project-with-no-state");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+
+        let error = with_current_dir(&cwd, || {
+            super::run_worker_state(CliOutputFormat::Text).expect_err("missing state should error")
+        });
+        let message = error.to_string();
+
+        // Keep the original locator so scripts grepping for it still work.
+        assert!(
+            message.contains("no worker state file found at"),
+            "error should keep the canonical prefix: {message}"
+        );
+        // New actionable hints — this is what #139 is fixing.
+        assert!(
+            message.contains("claw prompt"),
+            "error should name `claw prompt <text>` as a producer: {message}"
+        );
+        assert!(
+            message.contains("REPL"),
+            "error should mention the interactive REPL as a producer: {message}"
+        );
+        assert!(
+            message.contains("claw state"),
+            "error should tell the user what to rerun once state exists: {message}"
+        );
+        // And the State --help topic must document the worker relationship
+        // so claws can discover the contract without hitting the error first.
+        let state_help = render_help_topic(LocalHelpTopic::State);
+        assert!(
+            state_help.contains("Produces state"),
+            "state help must document how state is produced: {state_help}"
+        );
+        assert!(
+            state_help.contains("claw prompt"),
+            "state help must name `claw prompt <text>` as a producer: {state_help}"
+        );
     }
 
     #[test]
