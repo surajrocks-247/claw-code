@@ -5960,3 +5960,42 @@ But USAGE.md documents that "The error message now includes a hint that names th
 **Blocker:** None. Pure error-message UX improvement.
 
 **Source:** Clawhip nudge 2026-04-21 21:37 KST — discovered during dogfood probing of model validation.
+
+## Pinpoint #155. USAGE.md missing docs for `/ultraplan`, `/teleport`, `/bughunter` commands
+
+**Gap.** The `claw --help` output lists three interactive slash commands that are not documented in USAGE.md:
+- `/ultraplan [task]` — Run a deep planning prompt with multi-step reasoning
+- `/teleport <symbol-or-path>` — Jump to a file or symbol by searching the workspace
+- `/bughunter [scope]` — Inspect the codebase for likely bugs
+
+New users see these commands in the help output but have no explanation of:
+1. What each does
+2. How to use it
+3. What kind of input it expects
+4. When to use it (vs. other commands)
+5. Any limitations or prerequisites
+
+**Impact.** Users run `/ultraplan` or `/teleport` out of curiosity, or they skip these commands because they don't understand them. Documentation should lower the barrier to discovery.
+
+**Fix shape (~100 lines).** Add a new section to USAGE.md after "Interactive slash commands" covering:
+1. **Planning & Reasoning** — `/ultraplan [task]`
+   - Purpose: extended multi-step reasoning over a task
+   - Input: a task description or problem statement
+   - Output: a structured plan with steps and reasoning
+   - Example: `/ultraplan refactor this module to use async/await`
+2. **Navigation** — `/teleport <symbol-or-path>`
+   - Purpose: quickly jump to a file or function by name
+   - Input: a symbol name (function, class, struct) or file path
+   - Output: the file content with that symbol highlighted
+   - Example: `/teleport UserService`, `/teleport src/auth.rs`
+3. **Code Analysis** — `/bughunter [scope]`
+   - Purpose: scan the codebase for likely bugs or issues
+   - Input: optional scope (e.g., "src/handlers", "lib.rs")
+   - Output: list of suspicious patterns with explanations
+   - Example: `/bughunter src`, `/bughunter` (entire workspace)
+
+**Acceptance:** Each command has a one-line description, a practical example, and expected behavior documented.
+
+**Blocker:** None. Pure documentation.
+
+**Source:** Clawhip nudge 2026-04-21 21:47 KST — discovered discrepancy between `claw --help` and USAGE.md coverage.
