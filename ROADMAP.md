@@ -5720,3 +5720,61 @@ Threading: parser already knows the source (it's the arm that sets `model`). Pro
 **Not a regression of #128.** #128 was about rejecting malformed strings (now closed). #148 is about labeling the valid ones after resolution.
 
 **Source.** Jobdori dogfood 2026-04-21 20:40 KST on main HEAD `4cb8fa0` in response to Q's bundle hint. Split from historical #124 residual. Joins **truth-audit / diagnostic-integrity** cluster. Session tally: ROADMAP #148.
+
+## Pinpoint #149. `runtime::config::tests::validates_unknown_top_level_keys_with_line_and_field_name` flakes under parallel workspace test runs
+
+**Gap.** When `cargo test --workspace` runs with normal parallel test execution (default), `runtime::config::tests::validates_unknown_top_level_keys_with_line_and_field_name` intermittently fails. In isolation (`cargo test -p runtime validates_unknown_top_level_keys_with_line_and_field_name`), it passes deterministically. The same pattern affects other tests in `runtime/src/config.rs` and sibling test modules that share the `temp_dir()` naming strategy.
+
+**Verified on main HEAD `f84c7c4` (2026-04-21 20:50 KST):** witnessed during `cargo test --workspace` runs for #147 and #148 — one workspace run produced:
+
+```
+test config::tests::validates_unknown_top_level_keys_with_line_and_field_name ... FAILED
+test result: FAILED. 464 passed; 1 failed; 0 ignored; 0 measured
+```
+
+Same test passed on the next workspace run. Same test passes in isolation every time.
+
+**Root cause.** `runtime/src/config.rs` tests share this helper:
+
+```rust
+fn temp_dir() -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("runtime-config-{nanos}"))
+}
+```
+
+Two weaknesses:
+1. **Timestamp-only namespacing**: on fast machines with coarse-grained clocks (or with tests starting within the same nanosecond bucket), two tests pick the same path. One races `fs::create_dir_all()` with another's `fs::remove_dir_all()`.
+2. **No label differentiation**: every test in the file calls `temp_dir()` and constructs sub-paths inside the shared prefix. A `fs::remove_dir_all(root)` in one test's cleanup may clobber a live sibling.
+
+Other crates in the workspace (`plugins::tests::temp_dir`, `runtime::git_context::tests::temp_dir`) already use the **labeled** form `temp_dir(label)` to segregate namespaces per-test. `runtime/src/config.rs` was missed in that sweep.
+
+**Fix shape (~30 lines).** Convert `temp_dir()` in `runtime/src/config.rs` to `temp_dir(label: &str)` mirroring the plugins/git_context pattern, plus add a PID + atomic counter suffix for double-strength collision resistance:
+
+```rust
+fn temp_dir(label: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("...").as_nanos();
+    let pid = std::process::id();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("runtime-config-{label}-{pid}-{nanos}-{seq}"))
+}
+```
+
+Update each `temp_dir()` callsite in the file to pass a unique label (test function name usually works).
+
+**Acceptance.**
+- `cargo test --workspace` 10x consecutive runs all green (excluding pre-existing `resume_latest` flake which is orthogonal).
+- `cargo test -p runtime` 10x consecutive runs all green.
+- Cleanup `fs::remove_dir_all(root)` never races because `root` is guaranteed unique per-test.
+- No behavior change for tests already passing in isolation.
+
+**Blocker.** None. Mechanical rename + label addition.
+
+**Not applying to.** `plugins::tests::temp_dir` and `runtime::git_context::tests::temp_dir` already use the labeled form. The label pattern is the established workspace convention; this just applies it to the one holdout.
+
+**Source.** Jobdori dogfood 2026-04-21 20:50 KST, flagged during #147 and #148 workspace-test runs. Joins **test brittleness / flake** cluster. Session tally: ROADMAP #149.
