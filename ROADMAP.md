@@ -5302,3 +5302,70 @@ Usage:
 **Blocker.** None. Scoped to CLI parser + help text. ~50 lines + test.
 
 **Source.** Jobdori dogfood 2026-04-21 16:59 KST on main HEAD `27ffd75`. Joins **CLI/REPL parity** cluster (§7.1) and **discoverability** cluster (#108 did-you-mean, #127 --json on diagnostic verbs, #139 worker concept unactionable). Session tally: ROADMAP #141.
+
+## Pinpoint #142. `claw init --output-format json` dumps human text into `message` — no structured fields for created/skipped files
+
+**Gap.** `claw init --output-format json` emits a valid JSON envelope, but the payload is entirely a human-formatted multi-line text block packed into `message`. There are no structured fields to tell a claw script which files were created, which were skipped, or what the project path was.
+
+**Verified on main HEAD `21b377d` 2026-04-21 17:34 KST.**
+
+**Actual output (fresh directory, everything created):**
+```json
+{
+  "kind": "init",
+  "message": "Init\n  Project          /private/tmp/cd-1730b\n  .claw/           created\n  .claw.json       created\n  .gitignore       created\n  CLAUDE.md        created\n  Next step        Review and tailor the generated guidance"
+}
+```
+
+**Idempotent second call (everything skipped):**
+```json
+{
+  "kind": "init",
+  "message": "Init\n  Project          /private/tmp/cd-1730b\n  .claw/           skipped (already exists)\n  .claw.json       skipped (already exists)\n  .gitignore       skipped (already exists)\n  CLAUDE.md        skipped (already exists)\n  Next step        Review and tailor the generated guidance"
+}
+```
+
+**Compare `claw status --output-format json` (the model):**
+```json
+{
+  "kind": "status",
+  "model": "claude-opus-4-6",
+  "permission_mode": "danger-full-access",
+  "sandbox": { "active": false, "enabled": true, "fallback_reason": "...", ... },
+  "usage": { "cumulative_input": 0, "messages": 0, "turns": 0, ... },
+  "workspace": { "changed_files": 0, ... }
+}
+```
+
+**Why this is a clawability gap.**
+1. **Substring matching required**: to tell whether `.claw/` was created vs skipped, a claw has to grep the `message` string for `"created"` or `"skipped (already exists)"`. Not a contract — human-language fragility.
+2. **No programmatic idempotency signal**: CI/orchestration cannot easily tell "first run produced new files" from "second run was no-op". Both paths end up with `kind: init` and a free-form message.
+3. **Inconsistent with `status`/`sandbox`/`doctor`**: those subcommands have first-class structured JSON. `init` does not. Product contract asymmetry.
+4. **Path isn't a field**: the project path is embedded in the same string. No `project_path` key.
+5. **Joins JSON-output cluster** (#90, #91, #92, #127, #130, #136): every one of those was a JSON contract shortfall where the command technically emitted JSON but did not emit *useful* JSON.
+
+**Fix shape (~40 lines).**
+Add structured fields alongside `message` (keep `message` for backward compat):
+```json
+{
+  "kind": "init",
+  "project_path": "/private/tmp/cd-1730b",
+  "created": [".claw", ".claw.json", ".gitignore", "CLAUDE.md"],
+  "skipped": [],
+  "next_step": "Review and tailor the generated guidance",
+  "message": "Init\n  Project..."
+}
+```
+
+On idempotent call: `created: []`, `skipped: [".claw", ".claw.json", ...]`.
+
+**Acceptance.**
+- `claw init --output-format json` has `created`, `skipped`, `project_path`, `next_step` top-level fields
+- `created.len() + skipped.len() == 4` on standard init
+- Idempotent call has empty `created`
+- Existing `message` field preserved for text consumers (deprecation path only if needed)
+- Regression test: JSON schema assertions for both fresh + idempotent cases
+
+**Blocker.** None. Scoped to `init` subcommand JSON serializer. ~40 lines.
+
+**Source.** Jobdori dogfood 2026-04-21 17:34 KST on main HEAD `21b377d`. Joins **JSON output completeness** cluster (#90/#91/#92/#127/#130/#136). Session tally: ROADMAP #142.
