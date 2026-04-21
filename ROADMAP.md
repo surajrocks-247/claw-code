@@ -5778,3 +5778,57 @@ Update each `temp_dir()` callsite in the file to pass a unique label (test funct
 **Not applying to.** `plugins::tests::temp_dir` and `runtime::git_context::tests::temp_dir` already use the labeled form. The label pattern is the established workspace convention; this just applies it to the one holdout.
 
 **Source.** Jobdori dogfood 2026-04-21 20:50 KST, flagged during #147 and #148 workspace-test runs. Joins **test brittleness / flake** cluster. Session tally: ROADMAP #149.
+
+## Pinpoint #150. `resume_latest_restores_the_most_recent_managed_session` flakes due to symlink/canonicalization mismatch
+
+**Gap.** Test `resume_latest_restores_the_most_recent_managed_session` in `rusty-claude-cli/tests/resume_slash_commands.rs` intermittently fails when run as part of the workspace suite or in parallel.
+
+**Root cause.** `workspace_fingerprint(path)` hashes the workspace path string directly without canonicalization. On macOS, `/tmp` is a symlink to `/private/tmp`. The test creates a temp dir via `std::env::temp_dir().join(...)` which may return `/var/folders/...` (non-canonical). The test uses this non-canonical path to create sessions. When the subprocess spawns, `env::current_dir()` returns the canonical path `/private/var/folders/...`. The two fingerprints differ, so the subprocess looks in `.claw/sessions/<hash1>` while files are in `.claw/sessions/<hash2>`. Session discovery fails.
+
+**Verified on main HEAD `bc259ec` (2026-04-21 21:00 KST):** Test failed intermittently during workspace runs and consistently failed when run 5x in sequence before the fix.
+
+**Fix shape (~5 lines).** Call `fs::canonicalize(&project_dir)` after creating the directory but before passing it to `SessionStore::from_cwd()`. This ensures the test and subprocess use identical path representations when computing the fingerprint.
+
+```rust
+fs::create_dir_all(&project_dir).expect("project dir should exist");
+let project_dir = fs::canonicalize(&project_dir).unwrap_or(project_dir);
+let store = runtime::SessionStore::from_cwd(&project_dir).expect(...);
+```
+
+**Acceptance.**
+- `cargo test -p rusty-claude-cli --test resume_slash_commands` passes.
+- 5 consecutive runs all green (previously: 5/5 failed).
+- No behavior change; test now correctly isolates temp paths.
+
+**Blocker.** None.
+
+**Note.** This is the last known pre-existing test flake in the workspace. `resume_latest` was the only survivor from earlier sessions.
+
+**Source.** Jobdori dogfood 2026-04-21 21:00 KST, Q's "clean up remaining flake" hint led to root-cause analysis and fix. Session tally: ROADMAP #150.
+
+## Pinpoint #246. Reminder cron outcome ambiguity — no structured feedback on nudge delivery/skip/timeout
+
+**Gap (control-loop blocker).** The `clawcode-dogfood-cycle-reminder` cron triggers dogfood cycles every 10 minutes. When it times out (witnessed multiple times during 2026-04-21 sweep), there is no structured answer to: Was the nudge delivered? Did it fail before send? After send? Was it skipped due to an active cycle? Did the gateway drain and abort?
+
+**Impact.** Repeated timeouts produce scheduler fog instead of trustworthy dogfood pressure. Team cannot distinguish:
+- Silent delivery (nudge went out, cycle ran)
+- Delivery followed by subprocess crash (nudge reached Discord, but cycle had issues)
+- Timeout before send (cron died early)
+- Timeout after send (cron sent nudge, died before cleanup)
+- Deduplication (active cycle still running, nudge skipped)
+- Gateway draining (request in-flight when daemon shutdown)
+
+**Phase 1 spec (outcome schema).** Extend cron task results to include a `reminder_outcome` field with explicit values:
+- `"delivered"` — nudge successfully posted to Discord; next cycle can proceed
+- `"timed_out_before_send"` — cron died before posting; retry on next interval
+- `"timed_out_after_send"` — nudge posted (or should assume posted), but cleanup/logging timed out
+- `"skipped_due_to_active_cycle"` — previous cycle still running; no nudge issued
+- `"aborted_gateway_draining"` — reminding stopped because o p e n c l a w gateway is draining
+
+Deliverable: Update `clawcode-dogfood-cycle-reminder` task to emit this field on completion/timeout/skip.
+
+**Phase 2 (observability).** Log all five outcomes to Agentika and surface via `clawhip status` or similar monitoring surface so Q/gaebal-gajae can see nudge history.
+
+**Blocker.** Assigned to gaebal-gajae's domain (cron scheduling / o p e n c l a w orchestration). Not a claw-code CLI blocker; purely infrastructure/monitoring.
+
+**Source.** Q's direct observation during 2026-04-21 20:50–21:00 dogfood cycles: repeated timeouts with no way to diagnose. Session tally: ROADMAP #246.
