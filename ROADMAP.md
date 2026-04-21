@@ -5578,3 +5578,44 @@ MCP
 **Blocker.** None. `CliAction::Plugins` already exists with a working dispatcher.
 
 **Source.** Jobdori dogfood 2026-04-21 19:30 KST on main HEAD `faeaa1d` in response to Clawhip nudge. Joins **prompt misdelivery** cluster. Session tally: ROADMAP #145.
+
+## Pinpoint #146. `claw config` and `claw diff` are pure-local introspection commands but require `--resume SESSION.jsonl` wrapping
+
+**Gap.** Running `claw config` or `claw diff` directly exits with an error pointing to `claw --resume SESSION.jsonl /config` as the only path. Both commands are pure, read-only introspection: `config` reads files from disk and merges them; `diff` shells out to `git diff --cached` + `git diff`. Neither needs a session context to produce correct output.
+
+**Verified on main HEAD `7d63699` (2026-04-21 20:03 KST):**
+
+```
+$ claw config
+error: `claw config` is a slash command. Use `claw --resume SESSION.jsonl /config` or start `claw` and run `/config`.
+
+$ claw config --output-format json
+{"error":"`claw config` is a slash command. ...","type":"error"}
+
+$ claw diff
+error: `claw diff` is a slash command. Use `claw --resume SESSION.jsonl /diff` or start `claw` and run `/diff`.
+```
+
+Meanwhile `agents`, `mcp`, `skills`, `status`, `doctor`, `sandbox`, `plugins` (after #145) all work standalone.
+
+**Why this is a clawability gap.**
+1. **Synthetic friction**: requires a session file to inspect static disk state. A claw probing configuration has to spin up a session it doesn't need.
+2. **Surface asymmetry**: all other read-only diagnostics are standalone. `config` and `diff` are the remaining holdouts.
+3. **Pipeline-unfriendly**: `claw config --output-format json | jq` and `claw diff | less` are natural operator workflows; both are currently broken.
+4. **Both already have working JSON renderers** (`render_config_json`, `render_diff_json_for`) — infrastructure for top-level wiring exists.
+
+**Fix shape (~30 lines).** Add `"config"` and `"diff"` arms to the top-level parser in `main.rs` (mirroring #145's `plugins` wiring). Each dispatches to a new `CliAction` variant or to existing resume-supported renderers directly. Text mode uses `render_config_report` / `render_diff_report`; JSON mode uses `render_config_json` / `render_diff_json_for`. Remove `config` from `bare_slash_command_guidance`'s fallback allowlist only if explicitly gating (parser arm already short-circuits).
+
+**Acceptance.**
+- `claw config` exits 0 with discovered-file listing + merged-keys count.
+- `claw config --output-format json` emits typed envelope with discovered files and merged JSON.
+- `claw config env` / `claw config plugins` surface specific sections (matches `SlashCommand::Config { section }` semantics).
+- `claw diff` exits 0 with clean-tree message or staged/unstaged summary.
+- `claw diff --output-format json` emits typed envelope.
+- Regression tests: `parse_args(["config"])` → `CliAction::Config`; `parse_args(["diff"])` → `CliAction::Diff`.
+
+**Blocker.** None. Renderers exist and are resume-supported (proving they're pure-local).
+
+**Not applying to.** `hooks` (session-state-modifying, explicitly flagged "unsupported resumed slash command" in main.rs), `usage`, `context`, `tasks`, `theme`, `voice`, `rename`, `copy`, `color`, `effort`, `branch`, `rewind`, `ide`, `tag`, `output-style`, `add-dir` — all session-mutating or interactive-only.
+
+**Source.** Jobdori dogfood 2026-04-21 20:03 KST on main HEAD `7d63699` in response to Clawhip nudge. Joins **surface asymmetry** cluster (#145 sibling). Session tally: ROADMAP #146.
