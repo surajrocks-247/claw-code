@@ -1401,10 +1401,27 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     // Check provider/model format: provider_id/model_id
     let parts: Vec<&str> = trimmed.split('/').collect();
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-        return Err(format!(
+        // #154: hint if the model looks like it belongs to a different provider
+        let mut err_msg = format!(
             "invalid model syntax: '{}'. Expected provider/model (e.g., anthropic/claude-opus-4-6) or known alias (opus, sonnet, haiku)",
             trimmed
-        ));
+        );
+        if trimmed.starts_with("gpt-") || trimmed.starts_with("gpt_") {
+            err_msg.push_str("\nDid you mean `openai/");
+            err_msg.push_str(trimmed);
+            err_msg.push_str("`? (Requires OPENAI_API_KEY env var)");
+        }
+        else if trimmed.starts_with("qwen") {
+            err_msg.push_str("\nDid you mean `qwen/");
+            err_msg.push_str(trimmed);
+            err_msg.push_str("`? (Requires DASHSCOPE_API_KEY env var)");
+        }
+        else if trimmed.starts_with("grok") {
+            err_msg.push_str("\nDid you mean `xai/");
+            err_msg.push_str(trimmed);
+            err_msg.push_str("`? (Requires XAI_API_KEY env var)");
+        }
+        return Err(err_msg);
     }
     Ok(())
 }
@@ -10301,6 +10318,34 @@ mod tests {
             .expect_err("`doctor garbage` should fail without --json hint");
         assert!(!err_other.contains("--output-format json"),
             "unrelated args should not trigger --json hint: {err_other}");
+        // #154: model syntax error should hint at provider prefix when applicable
+        let err_gpt = parse_args(&["prompt".to_string(), "test".to_string(), "--model".to_string(), "gpt-4".to_string()])
+            .expect_err("`--model gpt-4` should fail with OpenAI hint");
+        assert!(
+            err_gpt.contains("Did you mean `openai/gpt-4`?"),
+            "GPT model error should hint openai/ prefix: {err_gpt}"
+        );
+        assert!(
+            err_gpt.contains("OPENAI_API_KEY"),
+            "GPT model error should mention env var: {err_gpt}"
+        );
+        let err_qwen = parse_args(&["prompt".to_string(), "test".to_string(), "--model".to_string(), "qwen-plus".to_string()])
+            .expect_err("`--model qwen-plus` should fail with DashScope hint");
+        assert!(
+            err_qwen.contains("Did you mean `qwen/qwen-plus`?"),
+            "Qwen model error should hint qwen/ prefix: {err_qwen}"
+        );
+        assert!(
+            err_qwen.contains("DASHSCOPE_API_KEY"),
+            "Qwen model error should mention env var: {err_qwen}"
+        );
+        // Unrelated invalid model should NOT get a hint
+        let err_garbage = parse_args(&["prompt".to_string(), "test".to_string(), "--model".to_string(), "asdfgh".to_string()])
+            .expect_err("`--model asdfgh` should fail");
+        assert!(
+            !err_garbage.contains("Did you mean"),
+            "Unrelated model errors should not get a hint: {err_garbage}"
+        );
     }
 
     #[test]

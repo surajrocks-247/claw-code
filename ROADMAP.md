@@ -5934,3 +5934,29 @@ This creates a confusing gap: users build successfully but then get "command not
 **Blocker:** None. Pure documentation.
 
 **Source:** Clawhip nudge 2026-04-21 21:27 KST — onboarding gap from #claw-code observations earlier this month.
+
+## Pinpoint #154. Model syntax error doesn't hint at env var when multiple credentials present
+
+**Gap.** When a user types `claw --model gpt-4` but only has `ANTHROPIC_API_KEY` set (no `OPENAI_API_KEY`), the error is:
+```
+error: invalid model syntax: 'gpt-4'. Expected provider/model (e.g., anthropic/claude-opus-4-6) or known alias (opus, sonnet, haiku)
+```
+
+But USAGE.md documents that "The error message now includes a hint that names the detected env var" — **this hint is not actually emitted.** The user gets a generic syntax error and has to re-read USAGE.md to discover they should type `openai/gpt-4` instead.
+
+**Expected behavior (from USAGE.md):** When the user has multiple providers' env vars set, or when a model name looks like it belongs to a different provider (e.g., `gpt-4` looks like OpenAI), the error should hint:
+- "Did you mean `openai/gpt-4`? (but `OPENAI_API_KEY` is not set)"
+- or "You have `ANTHROPIC_API_KEY` set but `gpt-4` looks like an OpenAI model. Try `openai/gpt-4` with `OPENAI_API_KEY` exported"
+
+**Current behavior:** Generic syntax error, user has to infer the fix from USAGE.md or guess.
+
+**Fix shape (~20 lines).** Enhance `FormatError::InvalidModelSyntax` or the model-parsing validation to:
+1. Detect if the model name looks like it belongs to a known provider (prefix `gpt-`, `openai/`, `qwen`, etc.)
+2. If it does, check if that provider's env var is missing
+3. Append a hint: "Did you mean \`{inferred_prefix}/{model}\`? (requires `{PROVIDER_KEY}` env var)"
+
+**Acceptance:** `claw --model gpt-4` produces a hint about OpenAI prefix and missing `OPENAI_API_KEY`. Same for `qwen-plus` → hint about `DASHSCOPE_API_KEY`, etc.
+
+**Blocker:** None. Pure error-message UX improvement.
+
+**Source:** Clawhip nudge 2026-04-21 21:37 KST — discovered during dogfood probing of model validation.
