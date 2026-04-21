@@ -824,8 +824,21 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     return Err(message);
                 }
             }
+            // #147: guard empty/whitespace-only prompts at the fallthrough
+            // path the same way `"prompt"` arm above does. Without this,
+            // `claw ""`, `claw "   "`, and `claw "" ""` silently route to
+            // the Anthropic call and surface a misleading
+            // `missing Anthropic credentials` error (or burn API tokens on
+            // an empty prompt when credentials are present).
+            let joined = rest.join(" ");
+            if joined.trim().is_empty() {
+                return Err(
+                    "empty prompt: provide a subcommand (run `claw --help`) or a non-empty prompt string"
+                        .to_string(),
+                );
+            }
             Ok(CliAction::Prompt {
-                prompt: rest.join(" "),
+                prompt: joined,
                 model,
                 output_format,
                 allowed_tools,
@@ -9742,6 +9755,36 @@ mod tests {
             CliAction::Diff {
                 output_format: CliOutputFormat::Json,
             }
+        );
+        // #147: empty / whitespace-only positional args must be rejected
+        // with a specific error instead of falling through to the prompt
+        // path (where they surface a misleading "missing Anthropic
+        // credentials" error or burn API tokens on an empty prompt).
+        let empty_err = parse_args(&["".to_string()])
+            .expect_err("empty positional arg should be rejected");
+        assert!(
+            empty_err.starts_with("empty prompt:"),
+            "empty-arg error should be specific, got: {empty_err}"
+        );
+        let whitespace_err = parse_args(&["   ".to_string()])
+            .expect_err("whitespace-only positional arg should be rejected");
+        assert!(
+            whitespace_err.starts_with("empty prompt:"),
+            "whitespace-only error should be specific, got: {whitespace_err}"
+        );
+        let multi_empty_err = parse_args(&["".to_string(), "".to_string()])
+            .expect_err("multiple empty positional args should be rejected");
+        assert!(
+            multi_empty_err.starts_with("empty prompt:"),
+            "multi-empty error should be specific, got: {multi_empty_err}"
+        );
+        // Typo guard from #108 must still take precedence for non-empty
+        // single-word non-prompt-looking inputs.
+        let typo_err = parse_args(&["sttaus".to_string()])
+            .expect_err("typo'd subcommand should be caught by #108 guard");
+        assert!(
+            typo_err.starts_with("unknown subcommand:"),
+            "typo guard should fire for 'sttaus', got: {typo_err}"
         );
     }
 

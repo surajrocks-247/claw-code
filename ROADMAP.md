@@ -5619,3 +5619,49 @@ Meanwhile `agents`, `mcp`, `skills`, `status`, `doctor`, `sandbox`, `plugins` (a
 **Not applying to.** `hooks` (session-state-modifying, explicitly flagged "unsupported resumed slash command" in main.rs), `usage`, `context`, `tasks`, `theme`, `voice`, `rename`, `copy`, `color`, `effort`, `branch`, `rewind`, `ide`, `tag`, `output-style`, `add-dir` — all session-mutating or interactive-only.
 
 **Source.** Jobdori dogfood 2026-04-21 20:03 KST on main HEAD `7d63699` in response to Clawhip nudge. Joins **surface asymmetry** cluster (#145 sibling). Session tally: ROADMAP #146.
+
+## Pinpoint #147. `claw ""` / `claw "   "` silently fall through to prompt-execution path; empty-prompt guard is subcommand-only
+
+**Gap.** The explicit `claw prompt ""` path rejects empty/whitespace-only prompts with a clear error (`prompt subcommand requires a prompt string`, exit 1, no network call). The implicit fallthrough path — where any unrecognized first positional arg is treated as a prompt — has no such guard. Result: `claw ""`, `claw "   "`, and `claw "" ""` all get routed to the Anthropic call with an empty prompt string, which surfaces the misleading `missing Anthropic credentials` error.
+
+**Verified on main HEAD `f877aca` (2026-04-21 20:32 KST):**
+
+```
+$ claw prompt ""
+error: prompt subcommand requires a prompt string
+
+$ claw ""
+error: missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY ...
+
+$ claw "   "
+error: missing Anthropic credentials; ...
+
+$ claw "" ""
+error: missing Anthropic credentials; ...
+
+$ claw --output-format json ""
+{"error":"missing Anthropic credentials; ...","type":"error"}
+```
+
+With valid credentials, the empty string would be sent to Claude as a user prompt — burning tokens for nothing, or getting a model-side refusal for empty input.
+
+**Why this is a clawability gap.**
+1. **Inconsistent guard**: the `"prompt"` subcommand arm enforces `if prompt.trim().is_empty() { Err(...) }`, but the fallthrough `other` arm in the same match block does not. Same contract should apply to both paths.
+2. **Prompt misdelivery (Clawhip category)**: same root pattern as #145 (wrong thing gets treated as a prompt). Different manifestation — here it's an empty string, not a typo'd subcommand.
+3. **Misleading error surface**: user sees `missing Anthropic credentials` for a request that should never have reached the API layer at all.
+4. **Clawhip risk**: a misconfigured orchestrator passing `""` or `"   "` as a positional arg ends up paying API costs for empty prompts instead of getting fast feedback.
+
+**Fix shape (~5 lines).** In `parse_subcommand()`'s fallthrough `other` arm, add the same trim-based empty check already used in the `"prompt"` arm, with a message that distinguishes it from the `prompt` subcommand path (e.g. `"empty prompt: provide a command or non-empty prompt text"`). Happens before `looks_like_subcommand_typo` since typos aren't empty.
+
+**Acceptance.**
+- `claw ""` exits 1 with a clear "empty prompt" error, no credential check.
+- `claw "   "` exits 1 with the same error.
+- `claw "" ""` exits 1 with the same error.
+- `claw --output-format json ""` emits the error in typed envelope, exit 1.
+- `claw hello` still reaches the typo guard (#108), not the empty guard.
+- `claw prompt ""` still emits its own specific error.
+- Regression test: `parse_args([""])` → Err, `parse_args(["   "])` → Err.
+
+**Blocker.** None. 5-line change in `parse_subcommand()`.
+
+**Source.** Jobdori dogfood 2026-04-21 20:32 KST on main HEAD `f877aca` in response to Clawhip nudge. Joins **prompt misdelivery** cluster (#145 sibling). Session tally: ROADMAP #147.
