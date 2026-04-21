@@ -375,6 +375,15 @@ enum LocalHelpTopic {
     Sandbox,
     Doctor,
     Acp,
+    // #141: extend the local-help pattern to every subcommand so
+    // `claw <subcommand> --help` has one consistent contract.
+    Init,
+    State,
+    Export,
+    Version,
+    SystemPrompt,
+    DumpManifests,
+    BootstrapPlan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,10 +430,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     && matches!(
                         rest[0].as_str(),
                         "prompt"
-                            | "version"
-                            | "state"
-                            | "init"
-                            | "export"
                             | "commit"
                             | "pr"
                             | "issue"
@@ -434,8 +439,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 // the arg to the API (e.g. `claw prompt --help`) should show
                 // top-level help instead. Subcommands that consume their own
                 // args (agents, mcp, plugins, skills) and local help-topic
-                // subcommands (status, sandbox, doctor) must NOT be intercepted
-                // here — they handle --help in their own dispatch paths.
+                // subcommands (status, sandbox, doctor, init, state, export,
+                // version, system-prompt, dump-manifests, bootstrap-plan) must
+                // NOT be intercepted here — they handle --help in their own
+                // dispatch paths via parse_local_help_action(). See #141.
                 wants_help = true;
                 index += 1;
             }
@@ -746,6 +753,17 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
         "sandbox" => LocalHelpTopic::Sandbox,
         "doctor" => LocalHelpTopic::Doctor,
         "acp" => LocalHelpTopic::Acp,
+        // #141: add the subcommands that were previously falling back
+        // to global help (init/state/export/version) or erroring out
+        // (system-prompt/dump-manifests) or printing their primary
+        // output instead of help text (bootstrap-plan).
+        "init" => LocalHelpTopic::Init,
+        "state" => LocalHelpTopic::State,
+        "export" => LocalHelpTopic::Export,
+        "version" => LocalHelpTopic::Version,
+        "system-prompt" => LocalHelpTopic::SystemPrompt,
+        "dump-manifests" => LocalHelpTopic::DumpManifests,
+        "bootstrap-plan" => LocalHelpTopic::BootstrapPlan,
         _ => return None,
     };
     Some(Ok(CliAction::HelpTopic(topic)))
@@ -5369,6 +5387,56 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Formats          text (default), json
   Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · claw --help"
             .to_string(),
+        LocalHelpTopic::Init => "Init
+  Usage            claw init [--output-format <format>]
+  Purpose          create .claw/, .claw.json, .gitignore, and CLAUDE.md in the current project
+  Output           list of created vs. skipped files (idempotent: safe to re-run)
+  Formats          text (default), json
+  Related          claw status · claw doctor"
+            .to_string(),
+        LocalHelpTopic::State => "State
+  Usage            claw state [--output-format <format>]
+  Purpose          read the worker state file written by the interactive REPL
+  Output           worker id, model, permissions, session reference (text or json)
+  Formats          text (default), json
+  Prerequisite     run `claw` interactively or `claw prompt <text>` to produce worker state first
+  Related          ROADMAP #139 (worker-concept discoverability) · claw status"
+            .to_string(),
+        LocalHelpTopic::Export => "Export
+  Usage            claw export [--session <id|latest>] [--output <path>] [--output-format <format>]
+  Purpose          serialize a managed session to JSON for review, transfer, or archival
+  Defaults         --session latest (most recent managed session in .claw/sessions/)
+  Formats          text (default), json
+  Related          /session list · claw --resume latest"
+            .to_string(),
+        LocalHelpTopic::Version => "Version
+  Usage            claw version [--output-format <format>]
+  Aliases          claw --version · claw -V
+  Purpose          print the claw CLI version and build metadata
+  Formats          text (default), json
+  Related          claw doctor (full build/auth/config diagnostic)"
+            .to_string(),
+        LocalHelpTopic::SystemPrompt => "System Prompt
+  Usage            claw system-prompt [--cwd <path>] [--date YYYY-MM-DD] [--output-format <format>]
+  Purpose          render the resolved system prompt that `claw` would send for the given cwd + date
+  Options          --cwd overrides the workspace dir · --date injects a deterministic date stamp
+  Formats          text (default), json
+  Related          claw doctor · claw dump-manifests"
+            .to_string(),
+        LocalHelpTopic::DumpManifests => "Dump Manifests
+  Usage            claw dump-manifests [--manifests-dir <path>] [--output-format <format>]
+  Purpose          emit every skill/agent/tool manifest the resolver would load for the current cwd
+  Options          --manifests-dir scopes discovery to a specific directory
+  Formats          text (default), json
+  Related          claw skills · claw agents · claw doctor"
+            .to_string(),
+        LocalHelpTopic::BootstrapPlan => "Bootstrap Plan
+  Usage            claw bootstrap-plan [--output-format <format>]
+  Purpose          list the ordered startup phases the CLI would execute before dispatch
+  Output           phase names (text) or structured phase list (json) — primary output is the plan itself
+  Formats          text (default), json
+  Related          claw doctor · claw status"
+            .to_string(),
     }
 }
 
@@ -8519,7 +8587,7 @@ mod tests {
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, permission_policy, print_help_to, push_output_block,
         render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
+        render_help_topic, render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
@@ -9485,6 +9553,50 @@ mod tests {
             parse_args(&["acp".to_string(), "--help".to_string()]).expect("acp help should parse"),
             CliAction::HelpTopic(LocalHelpTopic::Acp)
         );
+    }
+
+    #[test]
+    fn subcommand_help_flag_has_one_contract_across_all_subcommands_141() {
+        // #141: every documented subcommand must resolve `<subcommand> --help`
+        // to a subcommand-specific help topic, never to global help, never to
+        // an "unknown option" error, never to the subcommand's primary output.
+        let cases: &[(&str, LocalHelpTopic)] = &[
+            ("status", LocalHelpTopic::Status),
+            ("sandbox", LocalHelpTopic::Sandbox),
+            ("doctor", LocalHelpTopic::Doctor),
+            ("acp", LocalHelpTopic::Acp),
+            ("init", LocalHelpTopic::Init),
+            ("state", LocalHelpTopic::State),
+            ("export", LocalHelpTopic::Export),
+            ("version", LocalHelpTopic::Version),
+            ("system-prompt", LocalHelpTopic::SystemPrompt),
+            ("dump-manifests", LocalHelpTopic::DumpManifests),
+            ("bootstrap-plan", LocalHelpTopic::BootstrapPlan),
+        ];
+        for (subcommand, expected_topic) in cases {
+            for flag in ["--help", "-h"] {
+                let parsed = parse_args(&[subcommand.to_string(), flag.to_string()])
+                    .unwrap_or_else(|error| {
+                        panic!("`{subcommand} {flag}` should parse as help but errored: {error}")
+                    });
+                assert_eq!(
+                    parsed,
+                    CliAction::HelpTopic(*expected_topic),
+                    "`{subcommand} {flag}` should resolve to HelpTopic({expected_topic:?})"
+                );
+            }
+            // And the rendered help must actually mention the subcommand name
+            // (or its canonical title) so users know they got the right help.
+            let rendered = render_help_topic(*expected_topic);
+            assert!(
+                !rendered.is_empty(),
+                "{subcommand} help text should not be empty"
+            );
+            assert!(
+                rendered.contains("Usage"),
+                "{subcommand} help text should contain a Usage line"
+            );
+        }
     }
 
     #[test]
