@@ -5455,3 +5455,68 @@ Doctor keeps going and produces a full typed report. Status refuses to produce a
 **Blocker.** None for Phase 1. Phase 2 depends on the typed-error taxonomy landing (ROADMAP §4.44), but Phase 1 can ship independently and be tightened later.
 
 **Source.** Jobdori dogfood 2026-04-21 18:30 KST on main HEAD `e73b6a2`, surfaced by running `claw status` in `/Users/yeongyu/clawd` which contains a `.claw.json` with deliberately broken MCP entries. Joins **partial-success / degraded-mode** cluster (Principle #5, Phase 6) and **surface consistency** cluster (#141 help-contract unification, #108 typo guard). Session tally: ROADMAP #143.
+
+## Pinpoint #144. `claw mcp` hard-fails on malformed MCP config — same surface inconsistency as #143, one command over
+
+**Gap.** With `claw status` fixed in #143 Phase 1, `claw mcp` is now the remaining diagnostic surface that hard-fails on a malformed `.claw.json`. Same input, same parse error, same partial-success violation.
+
+**Verified on main HEAD `e2a43fc` (2026-04-21 18:59 KST):**
+
+Same `.claw.json` used for #143 repro (one valid `everything` server + one malformed `missing-command` entry).
+
+`claw mcp`:
+```
+error: /Users/.../.claw.json: mcpServers.missing-command: missing string field command
+Run `claw --help` for usage.
+```
+Exit 1. No list. The well-formed `everything` server is invisible.
+
+`claw mcp --output-format json`:
+```json
+{"error":"/Users/.../.claw.json: mcpServers.missing-command: missing string field command","type":"error"}
+```
+Exit 1. Same story.
+
+`claw status --output-format json` on the same file (post-#143):
+```json
+{"kind":"status","status":"degraded","config_load_error":"...","workspace":{...},"sandbox":{...},...}
+```
+Exit 0. Full envelope with error surfaced.
+
+**Why this is a clawability gap (same family as #143).**
+1. **Principle #5 violation**: partial success is first-class. One malformed entry shouldn't make the entire MCP subsystem invisible.
+2. **Surface inconsistency (cluster of 3)**: after #143 Phase 1, the behavior matrix is:
+   - `doctor` — degraded envelope ✅
+   - `status` — degraded envelope ✅ (#143)
+   - `mcp` — hard-fail ❌ (this pinpoint)
+3. **Clawhip impact**: `claw mcp --output-format json` is used by orchestrators to detect which MCP servers are available before invoking tools. A broken probe forces clawhip to fall back to doctor parse, which is suboptimal.
+
+**Fix shape (~40 lines, mirrors #143 Phase 1).**
+1. Make `render_mcp_report_json_for()` and `render_mcp_report_for()` catch the `ConfigError` at `loader.load()?`.
+2. On parse failure, emit a degraded envelope:
+   ```json
+   {
+     "kind": "mcp",
+     "action": "list",
+     "status": "degraded",
+     "config_load_error": "...",
+     "working_directory": "...",
+     "configured_servers": 0,
+     "servers": []
+   }
+   ```
+3. Text mode: prepend a "Config load error" block (same shape as #143) before the "MCP" block.
+4. Exit 0 so downstream probes don't treat a parse error as process death.
+
+**Acceptance.**
+- `claw mcp` and `claw mcp --output-format json` on a workspace with malformed config exit 0.
+- JSON mode includes `status: "degraded"` and `config_load_error` field.
+- Text mode shows the parse error in a separate block, not as the only output.
+- Clean path (no config errors) still returns `status: "ok"` (or equivalent — align with #143 serializer).
+- Regression test: inject malformed config, assert mcp returns degraded envelope.
+
+**Blocker.** None. Mirrors #143 Phase 1 shape exactly.
+
+**Future phase (joins #143 Phase 2).** When typed-error taxonomy lands (§4.44), promote `config_load_error` from string to typed object across `doctor`, `status`, and `mcp` in one pass.
+
+**Source.** Jobdori dogfood 2026-04-21 18:59 KST on main HEAD `e2a43fc`. Joins **partial-success** cluster (#143, Principle #5) and **surface consistency** cluster. Session tally: ROADMAP #144.
