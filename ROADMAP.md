@@ -830,6 +830,30 @@ Acceptance:
 - channel status updates stay short and machine-grounded
 - claws stop inferring state from raw build spam
 
+### 140. Deprecated `permissionMode` migration silently downgrades `DangerFullAccess` to `WorkspaceWrite`
+
+**Filed:** 2026-04-21 from dogfood cycle — `cargo test --workspace` on `main` HEAD `36b3a09` shows 1 deterministic failure.
+
+**Problem:** `tests::punctuation_bearing_single_token_still_dispatches_to_prompt` fails with:
+```
+assert left == right failed
+  left:  ... permission_mode: WorkspaceWrite ...
+  right: ... permission_mode: DangerFullAccess ...
+warning: .claw/settings.json: field "permissionMode" is deprecated (line 1). Use "permissions.defaultMode" instead
+```
+The test fixture writes a `.claw/settings.json` with the deprecated `permissionMode: "dangerFullAccess"` key. The migration/deprecation shim reads it but resolves to `WorkspaceWrite` instead of `DangerFullAccess`. Result: `cargo test --workspace` is red on `main` with 172 passing, 1 failing.
+
+**Root cause hypothesis:** The deprecated field reader in `parse_args` or `ConfigLoader` applies the `permissionMode` value through a permission-mode resolver that does not map `"dangerFullAccess"` to `PermissionMode::DangerFullAccess`, likely defaulting or falling back to `WorkspaceWrite`.
+
+**Fix shape:**
+- Ensure the deprecated-key migration path correctly maps `permissionMode: "dangerFullAccess"` → `PermissionMode::DangerFullAccess` (same as `permissions.defaultMode: "dangerFullAccess"`).
+- Alternatively, update the test fixture to use the canonical `permissions.defaultMode` key so it exercises the migration shim rather than depending on it.
+- Verify `cargo test --workspace` returns 0 failures.
+
+**Acceptance:**
+- `cargo test --workspace` passes with 0 failures on `main`.
+- Deprecated `permissionMode: "dangerFullAccess"` migrates cleanly to `DangerFullAccess` without downgrading to `WorkspaceWrite`.
+
 ### 137. Model-alias shorthand regression in test suite — bare alias parsing broken on `feat/134-135-session-identity` branch
 
 **Filed:** 2026-04-21 from dogfood cycle — `cargo test --workspace` on `feat/134-135-session-identity` HEAD (`91ba54d`) shows 3 failing tests.
