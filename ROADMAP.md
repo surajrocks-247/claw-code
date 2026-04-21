@@ -5247,3 +5247,58 @@ $ claw state --output-format json
 **Blocker.** None. Pure error-text + doc fix. ~30 lines.
 
 **Source.** Jobdori dogfood 2026-04-21 16:00 KST on main HEAD `f3f6643`. Joins **error-message-quality** cluster (related to §4.44 typed error taxonomy and §5 failure class enumeration). Joins **CLI discoverability** cluster (#108 did-you-mean for typos, #127 --json on diagnostic verbs). Session tally: ROADMAP #139.
+
+## Pinpoint #141. `claw <subcommand> --help` has 5 different behaviors — inconsistent help surface breaks discoverability
+
+**Gap.** Running `<subcommand> --help` has five different behaviors depending on which subcommand you pick. This breaks the expected CLI contract that `<subcommand> --help` returns subcommand-specific help.
+
+**Matrix (verified on main HEAD `27ffd75` 2026-04-21 16:59 KST):**
+
+| Subcommand | Behavior | Status |
+|---|---|---|
+| `status`, `sandbox`, `doctor`, `skills`, `agents`, `mcp`, `acp` | Subcommand-specific help | ✅ correct |
+| `version` | Global `claw --help` | ⚠️ inconsistent |
+| `init`, `export`, `state` | Global `claw --help` | ⚠️ inconsistent |
+| `dump-manifests`, `system-prompt` | `error: unknown <cmd> option: --help` | ❌ broken |
+| `bootstrap-plan` | Prints phases JSON (not help at all) | ❌ broken |
+
+**Concrete repro:**
+```
+$ claw system-prompt --help
+error: unknown system-prompt option: --help
+
+$ claw dump-manifests --help
+error: unknown dump-manifests option: --help
+
+$ claw bootstrap-plan --help
+- CliEntry
+- FastPathVersion
+...
+
+$ claw init --help
+claw v0.1.0
+Usage:
+  claw [--model MODEL] ...    # this is global help, not init-specific
+```
+
+**Why this is a clawability gap.**
+1. **Product principle violation**: every CLI subcommand should have a consistent `<cmd> --help` contract that returns subcommand-specific help.
+2. **CI/orchestration hazard**: a claw script that tries `<cmd> --help | grep <option>` gets structural behavior differences — some return 0, some return 1 with "unknown option", some return global help that doesn't mention the subcommand at all.
+3. **Discoverability asymmetry**: 7 subcommands have good help, 4 have global-help fallback, 2 error out, 1 produces irrelevant output. No documented reason for the split.
+4. **Follow-on from #108**: #108 fixed subcommand typos at the dispatch layer. #141 is the next layer up — even valid subcommands have inconsistent `--help` dispatch.
+
+**Fix shape (~50 lines).**
+1. For subcommands that return a structured help block (`status`, `sandbox`, `doctor`, `skills`, `agents`, `mcp`, `acp`): this is the model. Use the same pattern.
+2. For `init`, `export`, `state`, `version`: add subcommand-specific help block or explicitly dispatch `--help` to `claw --help` (consistent fallback is OK; returning global help that doesn't mention the subcommand is not).
+3. For `dump-manifests`, `system-prompt`: fix the parser to recognize `--help` as a dispatch rather than unknown flag. Add subcommand-specific help.
+4. For `bootstrap-plan`: add `--help` dispatch to explain what the subcommand does (currently prints phases, which is the primary output but not help text).
+5. Add a consistency test: `for cmd in <list>: assert exitcode_of("claw $cmd --help") == 0 and contains help text`.
+
+**Acceptance.**
+- All 14 subcommands have `<cmd> --help` exit 0 with relevant help text
+- No "unknown option" errors from `<cmd> --help`
+- Consistency test in the regression suite
+
+**Blocker.** None. Scoped to CLI parser + help text. ~50 lines + test.
+
+**Source.** Jobdori dogfood 2026-04-21 16:59 KST on main HEAD `27ffd75`. Joins **CLI/REPL parity** cluster (§7.1) and **discoverability** cluster (#108 did-you-mean, #127 --json on diagnostic verbs, #139 worker concept unactionable). Session tally: ROADMAP #141.
