@@ -6043,3 +6043,35 @@ New users see these commands in the help output but have no explanation of:
 **Blocker.** None. Natural Phase 3 progression from #77 P1 (JSON kind) → #156 (text kind) → #157 (structured remediation).
 
 **Source.** gaebal-gajae dogfood sweep 2026-04-22 05:30 KST — identified that `kind` is structured but `hint` remains prose-derived, leaving downstream claws with half an error contract.
+
+## Pinpoint #158. `compact_messages_if_needed` drops turns silently — no structured compaction event emitted
+
+**Gap.** `QueryEnginePort.compact_messages_if_needed()` (`src/query_engine.py:129`) silently truncates `mutable_messages` and `transcript_store` whenever turn count exceeds `compact_after_turns` (default 12). The truncation is invisible to any consumer — `TurnResult` carries no compaction indicator, the streaming path emits no `compaction_occurred` event, and `persist_session()` persists only the post-compaction slice. A claw polling session state after compaction sees the same `session_id` but a different (shorter) context window with no structured signal that turns were dropped.
+
+**Repro.**
+```python
+import sys; sys.path.insert(0, 'src')
+from query_engine import QueryEnginePort, QueryEngineConfig
+
+engine = QueryEnginePort.from_workspace()
+engine.config = QueryEngineConfig(compact_after_turns=3)
+for i in range(5):
+    r = engine.submit_message(f'turn {i}')
+    # TurnResult has no compaction field
+    assert not hasattr(r, 'compaction_occurred')  # passes every time
+print(len(engine.mutable_messages))  # 3 — silently truncated from 5
+```
+
+**Root cause.** `compact_messages_if_needed` is called inside `submit_message` with no return value and no side-channel notification. `stream_submit_message` yields a `message_stop` event that includes `transcript_size` but not a `compaction_occurred` flag or `turns_dropped` count.
+
+**Fix shape (~15 lines).**
+1. Add `compaction_occurred: bool` and `turns_dropped: int` to `TurnResult`.
+2. In `compact_messages_if_needed`, return `(bool, int)` — whether compaction ran and how many turns were dropped.
+3. Propagate into `TurnResult` in `submit_message`.
+4. In `stream_submit_message`, include `compaction_occurred` and `turns_dropped` in the `message_stop` event.
+
+**Acceptance.** A claw watching the stream can detect that compaction occurred and how many turns were silently dropped, without polling `transcript_size` across two consecutive turns.
+
+**Blocker.** None.
+
+**Source.** Jobdori dogfood sweep 2026-04-22 06:36 KST — probed `query_engine.py` compact path, confirmed no structured compaction signal in `TurnResult` or stream output.
