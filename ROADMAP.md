@@ -6075,3 +6075,32 @@ print(len(engine.mutable_messages))  # 3 — silently truncated from 5
 **Blocker.** None.
 
 **Source.** Jobdori dogfood sweep 2026-04-22 06:36 KST — probed `query_engine.py` compact path, confirmed no structured compaction signal in `TurnResult` or stream output.
+
+## Pinpoint #159. `run_turn_loop` hardcodes empty denied_tools — permission denials silently absent from multi-turn sessions
+
+**Gap.** `PortRuntime.run_turn_loop` (`src/runtime.py:163`) calls `engine.submit_message(turn_prompt, command_names, tool_names, ())` with a hardcoded empty tuple for `denied_tools`. By contrast, `bootstrap_session` calls `_infer_permission_denials(matches)` and passes the result. Result: any tool that would be denied (e.g., bash-family tools gated as "destructive") silently appears unblocked across all turns in `turn-loop` mode. The `TurnResult.permission_denials` tuple is always empty for multi-turn runs, giving a false "clean" permission picture to any claw consuming those results.
+
+**Repro.**
+```python
+import sys; sys.path.insert(0, 'src')
+from runtime import PortRuntime
+results = PortRuntime().run_turn_loop('run bash ls', max_turns=2)
+for r in results:
+    assert r.permission_denials == ()  # passes — denials never surfaced
+```
+
+Compare `bootstrap_session` for the same prompt — it produces a `PermissionDenial` for bash-family tools.
+
+**Root cause.** `src/runtime.py:163` — `engine.submit_message(turn_prompt, command_names, tool_names, ())`. The `()` is a hardcoded literal; `_infer_permission_denials` is never called in the turn-loop path.
+
+**Fix shape (~5 lines).** Before the turn loop, compute:
+```python
+denials = tuple(self._infer_permission_denials(matches))
+```
+Then pass `denied_tools=denials` to every `submit_message` call inside the loop. Mirrors the existing pattern in `bootstrap_session`.
+
+**Acceptance.** `run_turn_loop('run bash ls').permission_denials` is non-empty and matches what `bootstrap_session` returns for the same prompt. Multi-turn session security posture is symmetric with single-turn bootstrap.
+
+**Blocker.** None.
+
+**Source.** Jobdori dogfood sweep 2026-04-22 06:46 KST — diffed `bootstrap_session` vs `run_turn_loop` in `src/runtime.py`, confirmed asymmetric permission denial propagation.
