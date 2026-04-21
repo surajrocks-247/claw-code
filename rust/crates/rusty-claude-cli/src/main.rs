@@ -661,6 +661,30 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             args: join_optional_args(&rest[1..]),
             output_format,
         }),
+        // #145: `plugins` was routed through the prompt fallback because no
+        // top-level parser arm produced CliAction::Plugins. That made `claw
+        // plugins` (and `claw plugins --help`, `claw plugins list`, ...)
+        // attempt an Anthropic network call, surfacing the misleading error
+        // `missing Anthropic credentials` even though the command is purely
+        // local introspection. Mirror `agents`/`mcp`/`skills`: action is the
+        // first positional arg, target is the second.
+        "plugins" => {
+            let tail = &rest[1..];
+            let action = tail.first().cloned();
+            let target = tail.get(1).cloned();
+            if tail.len() > 2 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw plugins {}`: {}",
+                    tail[..2].join(" "),
+                    tail[2..].join(" ")
+                ));
+            }
+            Ok(CliAction::Plugins {
+                action,
+                target,
+                output_format,
+            })
+        }
         "skills" => {
             let args = join_optional_args(&rest[1..]);
             match classify_skills_slash_command(args.as_deref()) {
@@ -9547,6 +9571,52 @@ mod tests {
             CliAction::Agents {
                 args: Some("--help".to_string()),
                 output_format: CliOutputFormat::Text,
+            }
+        );
+        // #145: `plugins` must parse as CliAction::Plugins (not fall through
+        // to the prompt path, which would hit the Anthropic API for a purely
+        // local introspection command).
+        assert_eq!(
+            parse_args(&["plugins".to_string()]).expect("plugins should parse"),
+            CliAction::Plugins {
+                action: None,
+                target: None,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["plugins".to_string(), "list".to_string()])
+                .expect("plugins list should parse"),
+            CliAction::Plugins {
+                action: Some("list".to_string()),
+                target: None,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "plugins".to_string(),
+                "enable".to_string(),
+                "example-bundled".to_string(),
+            ])
+            .expect("plugins enable <target> should parse"),
+            CliAction::Plugins {
+                action: Some("enable".to_string()),
+                target: Some("example-bundled".to_string()),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "plugins".to_string(),
+                "--output-format".to_string(),
+                "json".to_string(),
+            ])
+            .expect("plugins --output-format json should parse"),
+            CliAction::Plugins {
+                action: None,
+                target: None,
+                output_format: CliOutputFormat::Json,
             }
         );
     }

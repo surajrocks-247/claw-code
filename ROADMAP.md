@@ -5520,3 +5520,61 @@ Exit 0. Full envelope with error surfaced.
 **Future phase (joins #143 Phase 2).** When typed-error taxonomy lands (§4.44), promote `config_load_error` from string to typed object across `doctor`, `status`, and `mcp` in one pass.
 
 **Source.** Jobdori dogfood 2026-04-21 18:59 KST on main HEAD `e2a43fc`. Joins **partial-success** cluster (#143, Principle #5) and **surface consistency** cluster. Session tally: ROADMAP #144.
+
+## Pinpoint #145. `claw plugins` subcommand not wired to CLI parser — word gets treated as a prompt, hits Anthropic API
+
+**Gap.** `claw plugins` (and `claw plugins list`, `claw plugins --help`, `claw plugins info <name>`, etc.) fall through the top-level subcommand match and get routed into the prompt-execution path. Result: a purely local introspection command triggers an Anthropic API call and surfaces `missing Anthropic credentials` to the user. With valid credentials, it would actually send the string `"plugins"` as a prompt to Claude, burning tokens for a local query.
+
+**Verified on main HEAD `faeaa1d` (2026-04-21 19:32 KST):**
+
+```
+$ claw plugins
+error: missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY before calling the Anthropic API
+
+$ claw plugins --output-format json
+{"error":"missing Anthropic credentials; ...","type":"error"}
+
+$ claw plugins --help
+error: missing Anthropic credentials; ...
+
+$ claw plugins list
+error: missing Anthropic credentials; ...
+
+$ ANTHROPIC_API_KEY=dummy claw plugins
+⠋ 🦀 Thinking...
+✘ ❌ Request failed
+error: api returned 401 Unauthorized (authentication_error)
+```
+
+Compare `agents`, `mcp`, `skills` — all recognized, all local, all exit 0:
+
+```
+$ claw agents
+No agents found.
+$ claw mcp
+MCP
+  Working directory ...
+  Configured servers 0
+```
+
+**Root cause.** In `rusty-claude-cli/src/main.rs`, the top-level `match rest[0].as_str()` parser has arms for `agents`, `mcp`, `skills`, `status`, `doctor`, `init`, `export`, `prompt`, etc., but **no arm for `plugins`**. The `CliAction::Plugins` variant exists, has a dispatcher (`print_plugins`), and is produced by `SlashCommand::Plugins` inside the REPL — but the top-level CLI path was never wired. Result: `plugins` matches neither a known subcommand nor a slash path, so it falls through to the default "run as prompt" behavior.
+
+**Why this is a clawability gap.**
+1. **Prompt misdelivery (explicit Clawhip category)**: the command string is sent to the LLM instead of dispatched locally. Real risk: without the credentials guard, `claw plugins` would send `"plugins"` as a user prompt to Claude, burning tokens.
+2. **Surface asymmetry**: `plugins` is the only diagnostic-adjacent command that isn't wired. Documentation, slash command, and dispatcher all exist; parser wiring was missed.
+3. **`--help` should never hit the network**. Anywhere.
+4. **Misleading error**: user running `claw plugins` sees an Anthropic credential error. No hint that `plugins` wasn't a recognized subcommand.
+
+**Fix shape (~20 lines).** Add a `"plugins"` arm to the top-level parser in `main.rs` that produces `CliAction::Plugins { action, target, output_format }`, following the same positional convention as `mcp` (`action` = first positional, `target` = second). The existing `CliAction::Plugins` handler (`LiveCli::print_plugins`) already covers text and JSON.
+
+**Acceptance.**
+- `claw plugins` exits 0 with plugins list (empty in a clean workspace, which is the honest state).
+- `claw plugins --output-format json` emits `{"kind":"plugin","action":"list",...}` with exit 0.
+- `claw plugins list` exits 0 and matches `claw plugins`.
+- `claw plugins info <name>` resolves through the existing handler.
+- No Anthropic network call occurs for any `plugins` invocation.
+- Regression test: parse `["claw", "plugins"]`, assert `CliAction::Plugins { action: None, target: None, .. }`.
+
+**Blocker.** None. `CliAction::Plugins` already exists with a working dispatcher.
+
+**Source.** Jobdori dogfood 2026-04-21 19:30 KST on main HEAD `faeaa1d` in response to Clawhip nudge. Joins **prompt misdelivery** cluster. Session tally: ROADMAP #145.
