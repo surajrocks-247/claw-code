@@ -5905,3 +5905,32 @@ pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
 **Blocker.** None. Implementation exists on worktree `jobdori-127-verb-suffix` but needs rebase against main (conflicts with #141 which already shipped).
 
 **Source.** Clawhip nudge 2026-04-21 21:17 KST — "no excuses, always find something to ship" directive. Session tally: ROADMAP #152.
+
+## Pinpoint #153. README/USAGE missing "add binary to PATH" and "verify install" bridge
+
+**Gap.** After `cargo build --workspace`, new users don't know:
+1. Where the binary actually ends up (e.g., `rust/target/debug/claw` vs. expecting it in `/usr/local/bin`)
+2. How to verify the build succeeded (e.g., `claw --help`, `which claw`, `claw doctor`)
+3. How to add it to PATH for shell integration (optional but common follow-up)
+
+This creates a confusing gap: users build successfully but then get "command not found: claw" and assume the build failed, or they immediately ask "how do I install this properly?"
+
+**Real examples from #claw-code:**
+- "claw not found — did the build fail?"
+- "do I need to `cargo install` this?"
+- "why is the binary at `rust/target/debug/claw` and not just `claw`?"
+
+**Fix shape (~50 lines).** Add a new "Post-build verification and PATH" section in README (after Quick start) covering:
+1. **Where the binary lives:** `rust/target/debug/claw` (debug build) or `rust/target/release/claw` (release)
+2. **Verify it works:** Run `./rust/target/debug/claw --help` and `./rust/target/debug/claw doctor`
+3. **Optional: Add to PATH** — three approaches:
+   - symlink: `ln -s $(pwd)/rust/target/debug/claw /usr/local/bin/claw`
+   - `cargo install --path ./rust` (builds and installs to `~/.cargo/bin/`)
+   - update shell profile to export PATH
+4. **Windows equivalent:** Point to `rust\target\debug\claw.exe` and `cargo install --path .\rust`
+
+**Acceptance:** New users can find the binary location, run it directly, and know their first verification step is `claw doctor`.
+
+**Blocker:** None. Pure documentation.
+
+**Source:** Clawhip nudge 2026-04-21 21:27 KST — onboarding gap from #claw-code observations earlier this month.
