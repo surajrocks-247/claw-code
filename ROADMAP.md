@@ -5832,3 +5832,56 @@ Deliverable: Update `clawcode-dogfood-cycle-reminder` task to emit this field on
 **Blocker.** Assigned to gaebal-gajae's domain (cron scheduling / o p e n c l a w orchestration). Not a claw-code CLI blocker; purely infrastructure/monitoring.
 
 **Source.** Q's direct observation during 2026-04-21 20:50–21:00 dogfood cycles: repeated timeouts with no way to diagnose. Session tally: ROADMAP #246.
+
+## Pinpoint #151. `workspace_fingerprint` path-equivalence contract gap (product, not just test)
+
+**Gap.** `workspace_fingerprint(path)` hashes the raw path string without canonicalization. Two callers passing equivalent paths (e.g. `/tmp/foo` vs `/private/tmp/foo` on macOS where `/tmp` is a symlink to `/private/tmp`) get different fingerprints and therefore different session stores. #150 was the test-side symptom; the product contract itself is still fragile.
+
+**Discovery path.** #150 fix (canonicalize in test) was a workaround. Real users hit this whenever:
+1. Embedded callers pass a raw `--data-dir` path that differs from canonical `env::current_dir()`
+2. Programmatic use of `SessionStore::from_cwd(some_path)` with a non-canonical input
+3. Symlinks elsewhere in the filesystem (not just macOS `/tmp`): NixOS store paths, Docker bind mounts, network mounts with case-insensitive normalization, etc.
+
+The REPL's default flow happens to work because `env::current_dir()` returns canonicalized paths on macOS. But anyone calling `SessionStore::from_cwd()` with a user-supplied path risks silent session-store divergence.
+
+**Root cause.** The function treats path-string equality and path-equivalence as the same thing:
+
+```rust
+pub fn workspace_fingerprint(workspace_root: &Path) -> String {
+    let input = workspace_root.to_string_lossy();  // ← raw bytes
+    // ... FNV-1a hash ...
+}
+```
+
+**Fix shape (~10 lines).** Canonicalize inside `SessionStore::from_cwd()` (and `from_data_dir`) before computing the fingerprint. Keep `workspace_fingerprint()` itself as a pure function of its input for determinism — the canonicalization is the caller's responsibility, but the two production entry points should always canonicalize.
+
+```rust
+pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
+    let cwd = cwd.as_ref();
+    // #151: canonicalize so that equivalent paths (symlinks, ./foo vs /abs/foo)
+    // produce the same workspace_fingerprint. Falls back to the raw path when
+    // canonicalize() fails (e.g. directory doesn't exist yet — callers that
+    // haven't materialized the workspace).
+    let canonical_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let sessions_root = canonical_cwd
+        .join(".claw")
+        .join("sessions")
+        .join(workspace_fingerprint(&canonical_cwd));
+    fs::create_dir_all(&sessions_root)?;
+    Ok(Self {
+        sessions_root,
+        workspace_root: canonical_cwd,
+    })
+}
+```
+
+**Backward compatibility.** Existing users on macOS where `env::current_dir()` already returns canonical paths: no change in hash. Users who ever called with a non-canonical path: hash would change, but those sessions were already broken (couldn't be resumed from a canonical-path cwd). Net improvement.
+
+**Acceptance.**
+- Revert the test-side workaround from #150; test still passes.
+- Add regression test: `SessionStore::from_cwd("/tmp/foo")` and `SessionStore::from_cwd("/private/tmp/foo")` return stores with identical `sessions_dir()` on macOS.
+- Workspace tests green.
+
+**Blocker.** None.
+
+**Source.** Q's ack on #150 surfaced the deeper gap: "#150 closed is real value" but the product function still has the brittleness. Session tally: ROADMAP #151.
