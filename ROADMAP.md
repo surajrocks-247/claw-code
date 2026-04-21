@@ -5136,3 +5136,38 @@ Current state is **design question unresolved**. Implementation is straightforwa
 **Source.** Jobdori dogfood 2026-04-21 14:25-14:47 KST — multi-cycle convergence pattern exposed by repeat nudges on #134/#135 bundle. Joins **Dogfood loop observability** (related to earlier §4.7 session-identity, but one level up — session-identity is plumbing, closure-state is the **reporting contract**). Also joins **False-green report gating** (from 14:05 finding) — this is the downstream effect: unclear reports beget re-nudges on stale work.
 
 Session tally: ROADMAP #138.
+
+### Evidence for #138 — feat/134-135-session-identity branch is pushed but no PR was opened (2026-04-21 15:05)
+
+**Concrete gap observed:**
+- Branch `feat/134-135-session-identity` pushed to `origin` at `7235260` (commits `f55612e`, `2b7095e`, `230d97a`, `7235260`)
+- Dogfood loop declared bundle "merge-ready" at 14:25
+- ~40 min elapsed; no PR opened, no merge, branch still unmerged
+- Meanwhile #136 and #137 landed directly on main (`a8beca1`, `21adae9`) without going through the branch
+
+**Direct verification of #135 on main:**
+- `env -i $BIN status --output-format json` on main HEAD `768c1ab` shows `active_session: null, session_id: null`
+- Fields exist in JSON schema (added by schema-only?) but values are None because the producer plumbing (`#134`) is not on main
+- #135 consumer relies on #134 producer; both live on feat/134-135 only
+
+**Impact:**
+- `claw status --output-format json` on main returns JSON without the #135 session identity signals (because they're only on feat/134-135)
+- Orchestrators that shipped using the 13:00 "round-trip proof" report believing #134+#135 was merge-ready will get null fields
+- Evidence for #138: "closure-state" = "pushed branch" ≠ "merged" ≠ "in-PR" — nudge surface collapses all three
+
+**Proposed closure-state transition:**
+1. `pushed` — branch exists on origin but no PR (current state for feat/134-135)
+2. `in-PR` — PR open, review pending
+3. `approved` — PR approved, awaiting merge
+4. `merged` — in main
+5. `deployed` — if applicable
+6. `abandoned` — PR closed without merge
+
+Nudge surface should report explicit state + timestamp: `"feat/134-135 state=pushed (no PR) since 13:00; no closure action taken"` instead of ambiguous "merge-ready."
+
+**Token/permission note:**
+- `code-yeongyu` token has write access to push branches to `ultraworkers/claw-code` but lacks `createPullRequest` permission (GraphQL 404)
+- Issues are disabled on the repo (can't open issue-based tracking)
+- Means closure-state tracking must live inside the repo (ROADMAP) or in an external surface (Discord message edits, `.dogfood-closure.json`)
+
+**Filed:** 2026-04-21 15:05 KST as evidence for #138 by Jobdori dogfood loop.
