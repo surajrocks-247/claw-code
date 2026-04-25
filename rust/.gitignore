@@ -3,3 +3,4 @@
 /.cargo/registry
 */target
 Cargo.lock
+.claw
